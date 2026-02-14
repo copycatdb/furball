@@ -1,33 +1,34 @@
-# furball 🤮
+# furball 🐱
 
-ODBC driver for SQL Server. Powered by tabby. Nobody asked for this but here we are.
+ODBC driver for SQL Server. Powered by [tabby](https://github.com/copycatdb/tabby).
 
 Part of [CopyCat](https://github.com/copycatdb) 🐱
 
 ## What is this?
 
-An ODBC driver that implements the ODBC API but uses [tabby](https://github.com/copycatdb/tabby) underneath instead of the Microsoft ODBC Driver. Why? Because sometimes your enterprise software only speaks ODBC and you have no choice. We understand. We dont judge.
+An ODBC driver for SQL Server that uses tabby's Rust TDS implementation under the hood. Drop-in replacement for the Microsoft ODBC Driver — same ODBC API, different engine.
 
-## But why?
+## Why ODBC?
 
-Look, we know. ODBC is the COBOL of database connectivity. Its been around since 1992 and refuses to die. But some things in this world require ODBC:
+ODBC is the universal adapter of the database world. It's been the standard since 1992 and it's still everywhere — not because nothing better came along, but because it *works*. Thirty years of tooling, integrations, and institutional knowledge don't just disappear.
 
-- Excel "Get Data"
-- Crystal Reports (yes, people still use it)
-- That one Java app from 2007 that nobody wants to touch
-- Corporate policies written in stone tablets
+ODBC connects:
+- **Excel, Power BI, Tableau** — the tools analysts actually use every day
+- **Enterprise ETL pipelines** — Informatica, SSIS, Talend, you name it
+- **Every language ever** — Python (pyodbc), Java (JDBC-ODBC bridge), .NET, C/C++, Go, Ruby, Perl...
+- **Legacy systems that run the world** — banks, hospitals, governments
 
-So here we are. An ODBC driver. In Rust. Using a cat. To talk to SQL Server.
+The Microsoft ODBC Driver for SQL Server is excellent — rock solid, fully featured, regularly updated. furball isn't here to replace it. It's here to give the ODBC ecosystem another option: one built on tabby's modern Rust TDS stack, with no C/C++ dependencies, cross-compilable, and embeddable.
 
-Were not proud. But were here.
+Think of it like how there are multiple PostgreSQL ODBC drivers (psqlODBC, the Devart one, etc.). More options = healthier ecosystem.
 
 ## Status
 
-🚧 Coming eventually. We need therapy first.
+🚧 Coming soon. tabby handles the TDS protocol, furball wraps it in the ODBC C API.
 
 ## Attribution
 
-Inspired by [psqlODBC](https://github.com/postgresql-interfaces/psqlodbc) and the Microsoft ODBC Driver for SQL Server. Both have suffered so we dont have to. Mostly.
+Standing on the shoulders of [psqlODBC](https://github.com/postgresql-interfaces/psqlodbc) (the OG open-source ODBC driver) and the [Microsoft ODBC Driver for SQL Server](https://learn.microsoft.com/en-us/sql/connect/odbc/microsoft-odbc-driver-for-sql-server) (the gold standard). Both paved the road we're driving on.
 
 ## License
 
