@@ -1,5 +1,8 @@
 # furball 🐱
 
+[![CI](https://github.com/copycatdb/furball/actions/workflows/ci.yml/badge.svg)](https://github.com/copycatdb/furball/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/copycatdb/furball/branch/main/graph/badge.svg)](https://codecov.io/gh/copycatdb/furball)
+
 ODBC driver for SQL Server. Powered by [tabby](https://github.com/copycatdb/tabby).
 
 Part of [CopyCat](https://github.com/copycatdb) 🐱
