@@ -34,6 +34,8 @@ pub enum CellValue {
         scale: u8,
     },
     Guid([u8; 16]),
+    /// Raw UTF-16 data — avoids UTF-16→UTF-8→UTF-16 round-trip for SQL_C_WCHAR
+    Utf16(Vec<u16>),
 }
 
 impl CellValue {
@@ -62,6 +64,7 @@ impl CellValue {
             }
             CellValue::Decimal { value, scale, .. } => Some(format_decimal(*value, *scale)),
             CellValue::Guid(bytes) => Some(format_guid_str(bytes)),
+            CellValue::Utf16(u) => Some(String::from_utf16_lossy(u)),
         }
     }
 }
@@ -446,6 +449,14 @@ impl RowWriter for StringRowWriter {
     }
     fn write_str(&mut self, _col: usize, val: &str) {
         self.current_row.push(CellValue::String(val.to_string()));
+    }
+    fn write_utf16(&mut self, _col: usize, val: &[u16]) {
+        // On Linux, pyodbc requests SQL_C_CHAR (UTF-8), so store as String
+        // to avoid a redundant UTF-16→String conversion in get_data.
+        // On Windows (SQL_C_WCHAR), storing as Utf16 would be faster,
+        // but String works correctly for both paths.
+        self.current_row
+            .push(CellValue::String(String::from_utf16_lossy(val)));
     }
     fn write_bytes(&mut self, _col: usize, val: &[u8]) {
         self.current_row.push(CellValue::Bytes(val.to_vec()));

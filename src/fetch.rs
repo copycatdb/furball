@@ -38,6 +38,10 @@ impl<'a> tabby::RowWriter for SingleRowWriter<'a> {
     fn write_str(&mut self, _col: usize, val: &str) {
         self.row.push(CellValue::String(val.to_string()));
     }
+    fn write_utf16(&mut self, _col: usize, val: &[u16]) {
+        self.row
+            .push(CellValue::String(String::from_utf16_lossy(val)));
+    }
     fn write_bytes(&mut self, _col: usize, val: &[u8]) {
         self.row.push(CellValue::Bytes(val.to_vec()));
     }
@@ -402,9 +406,14 @@ pub fn get_data(
             }
         }
         SQL_C_WCHAR => {
-            // Convert to string, then UTF-16
-            let val = cell.to_string_repr().unwrap_or_default();
-            let utf16: Vec<u16> = val.encode_utf16().collect();
+            // Fast path: if we already have UTF-16, skip encoding entirely
+            let utf16: std::borrow::Cow<[u16]> = match cell {
+                CellValue::Utf16(u) => std::borrow::Cow::Borrowed(u.as_slice()),
+                _ => {
+                    let val = cell.to_string_repr().unwrap_or_default();
+                    std::borrow::Cow::Owned(val.encode_utf16().collect())
+                }
+            };
             let total_bytes = (utf16.len() * 2) as SQLLEN;
             let offset = stmt.read_offsets[col_idx]; // offset in u16 units
             let remaining_u16 = if offset < utf16.len() {
