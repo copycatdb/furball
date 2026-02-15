@@ -255,3 +255,5 @@ pub struct SqlGuid {
     pub data3: u16,
     pub data4: [u8; 8],
 }
+
+pub const SQL_ALL_TYPES: SQLSMALLINT = 0;

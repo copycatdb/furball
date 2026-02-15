@@ -1,6 +1,7 @@
 #![allow(non_snake_case)]
 
 mod attr;
+mod catalog;
 mod connect;
 mod diagnostics;
 mod execute;
@@ -1437,11 +1438,13 @@ pub extern "C" fn SQLMoreResults(hstmt: SQLHSTMT) -> SQLRETURN {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn SQLGetTypeInfo(hstmt: SQLHSTMT, _data_type: SQLSMALLINT) -> SQLRETURN {
+pub extern "C" fn SQLGetTypeInfo(hstmt: SQLHSTMT, data_type: SQLSMALLINT) -> SQLRETURN {
     if hstmt.is_null() {
         return SQL_INVALID_HANDLE;
     }
-    SQL_SUCCESS
+    let stmt = unsafe { &mut *(hstmt as *mut Statement) };
+    stmt.diagnostics.clear();
+    catalog::get_type_info(stmt, data_type)
 }
 
 #[unsafe(no_mangle)]
@@ -1815,13 +1818,13 @@ pub extern "C" fn SQLGetFunctions(
 #[unsafe(no_mangle)]
 pub extern "C" fn SQLSpecialColumns(
     hstmt: SQLHSTMT,
-    _id_type: SQLUSMALLINT,
-    _catalog: *const SQLCHAR,
-    _catalog_len: SQLSMALLINT,
-    _schema: *const SQLCHAR,
-    _schema_len: SQLSMALLINT,
-    _table: *const SQLCHAR,
-    _table_len: SQLSMALLINT,
+    id_type: SQLUSMALLINT,
+    catalog: *const SQLCHAR,
+    catalog_len: SQLSMALLINT,
+    schema: *const SQLCHAR,
+    schema_len: SQLSMALLINT,
+    table: *const SQLCHAR,
+    table_len: SQLSMALLINT,
     _scope: SQLUSMALLINT,
     _nullable: SQLUSMALLINT,
 ) -> SQLRETURN {
@@ -1829,120 +1832,125 @@ pub extern "C" fn SQLSpecialColumns(
         return SQL_INVALID_HANDLE;
     }
     let stmt = unsafe { &mut *(hstmt as *mut Statement) };
-    stmt.columns.clear();
-    stmt.rows.clear();
-    stmt.row_index = -1;
-    stmt.executed = true;
-    SQL_SUCCESS
+    stmt.diagnostics.clear();
+    let cat = unsafe { sql_str(catalog, catalog_len) };
+    let sch = unsafe { sql_str(schema, schema_len) };
+    let tbl = unsafe { sql_str(table, table_len) };
+    catalog::special_columns(stmt, id_type, &cat, &sch, &tbl)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn SQLSpecialColumnsW(
     hstmt: SQLHSTMT,
     id_type: SQLUSMALLINT,
-    _catalog: *const SQLWCHAR,
-    _catalog_len: SQLSMALLINT,
-    _schema: *const SQLWCHAR,
-    _schema_len: SQLSMALLINT,
-    _table: *const SQLWCHAR,
-    _table_len: SQLSMALLINT,
+    catalog: *const SQLWCHAR,
+    catalog_len: SQLSMALLINT,
+    schema: *const SQLWCHAR,
+    schema_len: SQLSMALLINT,
+    table: *const SQLWCHAR,
+    table_len: SQLSMALLINT,
     scope: SQLUSMALLINT,
     nullable: SQLUSMALLINT,
 ) -> SQLRETURN {
-    SQLSpecialColumns(
-        hstmt,
-        id_type,
-        ptr::null(),
-        0,
-        ptr::null(),
-        0,
-        ptr::null(),
-        0,
-        scope,
-        nullable,
-    )
+    if hstmt.is_null() {
+        return SQL_INVALID_HANDLE;
+    }
+    let stmt = unsafe { &mut *(hstmt as *mut Statement) };
+    stmt.diagnostics.clear();
+    let cat = wchar_to_string(catalog, catalog_len);
+    let sch = wchar_to_string(schema, schema_len);
+    let tbl = wchar_to_string(table, table_len);
+    let _ = (scope, nullable);
+    catalog::special_columns(stmt, id_type, &cat, &sch, &tbl)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn SQLStatistics(
     hstmt: SQLHSTMT,
-    _catalog: *const SQLCHAR,
-    _catalog_len: SQLSMALLINT,
-    _schema: *const SQLCHAR,
-    _schema_len: SQLSMALLINT,
-    _table: *const SQLCHAR,
-    _table_len: SQLSMALLINT,
-    _unique: SQLUSMALLINT,
+    catalog: *const SQLCHAR,
+    catalog_len: SQLSMALLINT,
+    schema: *const SQLCHAR,
+    schema_len: SQLSMALLINT,
+    table: *const SQLCHAR,
+    table_len: SQLSMALLINT,
+    unique: SQLUSMALLINT,
     _reserved: SQLUSMALLINT,
 ) -> SQLRETURN {
     if hstmt.is_null() {
         return SQL_INVALID_HANDLE;
     }
     let stmt = unsafe { &mut *(hstmt as *mut Statement) };
-    stmt.columns.clear();
-    stmt.rows.clear();
-    stmt.row_index = -1;
-    stmt.executed = true;
-    SQL_SUCCESS
+    stmt.diagnostics.clear();
+    let cat = unsafe { sql_str(catalog, catalog_len) };
+    let sch = unsafe { sql_str(schema, schema_len) };
+    let tbl = unsafe { sql_str(table, table_len) };
+    catalog::statistics(stmt, &cat, &sch, &tbl, unique)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn SQLStatisticsW(
     hstmt: SQLHSTMT,
-    _catalog: *const SQLWCHAR,
-    _catalog_len: SQLSMALLINT,
-    _schema: *const SQLWCHAR,
-    _schema_len: SQLSMALLINT,
-    _table: *const SQLWCHAR,
-    _table_len: SQLSMALLINT,
+    catalog: *const SQLWCHAR,
+    catalog_len: SQLSMALLINT,
+    schema: *const SQLWCHAR,
+    schema_len: SQLSMALLINT,
+    table: *const SQLWCHAR,
+    table_len: SQLSMALLINT,
     unique: SQLUSMALLINT,
     reserved: SQLUSMALLINT,
-) -> SQLRETURN {
-    SQLStatistics(
-        hstmt,
-        ptr::null(),
-        0,
-        ptr::null(),
-        0,
-        ptr::null(),
-        0,
-        unique,
-        reserved,
-    )
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn SQLPrimaryKeys(
-    hstmt: SQLHSTMT,
-    _catalog: *const SQLCHAR,
-    _catalog_len: SQLSMALLINT,
-    _schema: *const SQLCHAR,
-    _schema_len: SQLSMALLINT,
-    _table: *const SQLCHAR,
-    _table_len: SQLSMALLINT,
 ) -> SQLRETURN {
     if hstmt.is_null() {
         return SQL_INVALID_HANDLE;
     }
     let stmt = unsafe { &mut *(hstmt as *mut Statement) };
-    stmt.columns.clear();
-    stmt.rows.clear();
-    stmt.row_index = -1;
-    stmt.executed = true;
-    SQL_SUCCESS
+    stmt.diagnostics.clear();
+    let cat = wchar_to_string(catalog, catalog_len);
+    let sch = wchar_to_string(schema, schema_len);
+    let tbl = wchar_to_string(table, table_len);
+    let _ = reserved;
+    catalog::statistics(stmt, &cat, &sch, &tbl, unique)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn SQLPrimaryKeys(
+    hstmt: SQLHSTMT,
+    catalog: *const SQLCHAR,
+    catalog_len: SQLSMALLINT,
+    schema: *const SQLCHAR,
+    schema_len: SQLSMALLINT,
+    table: *const SQLCHAR,
+    table_len: SQLSMALLINT,
+) -> SQLRETURN {
+    if hstmt.is_null() {
+        return SQL_INVALID_HANDLE;
+    }
+    let stmt = unsafe { &mut *(hstmt as *mut Statement) };
+    stmt.diagnostics.clear();
+    let cat = unsafe { sql_str(catalog, catalog_len) };
+    let sch = unsafe { sql_str(schema, schema_len) };
+    let tbl = unsafe { sql_str(table, table_len) };
+    catalog::primary_keys(stmt, &cat, &sch, &tbl)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn SQLPrimaryKeysW(
     hstmt: SQLHSTMT,
-    _catalog: *const SQLWCHAR,
-    _catalog_len: SQLSMALLINT,
-    _schema: *const SQLWCHAR,
-    _schema_len: SQLSMALLINT,
-    _table: *const SQLWCHAR,
-    _table_len: SQLSMALLINT,
+    catalog: *const SQLWCHAR,
+    catalog_len: SQLSMALLINT,
+    schema: *const SQLWCHAR,
+    schema_len: SQLSMALLINT,
+    table: *const SQLWCHAR,
+    table_len: SQLSMALLINT,
 ) -> SQLRETURN {
-    SQLPrimaryKeys(hstmt, ptr::null(), 0, ptr::null(), 0, ptr::null(), 0)
+    if hstmt.is_null() {
+        return SQL_INVALID_HANDLE;
+    }
+    let stmt = unsafe { &mut *(hstmt as *mut Statement) };
+    stmt.diagnostics.clear();
+    let cat = wchar_to_string(catalog, catalog_len);
+    let sch = wchar_to_string(schema, schema_len);
+    let tbl = wchar_to_string(table, table_len);
+    catalog::primary_keys(stmt, &cat, &sch, &tbl)
 }
 
 // ── SQLForeignKeys / SQLProcedures (stubs) ──────────────────────────
@@ -1950,61 +1958,61 @@ pub extern "C" fn SQLPrimaryKeysW(
 #[unsafe(no_mangle)]
 pub extern "C" fn SQLForeignKeys(
     hstmt: SQLHSTMT,
-    _pk_cat: *const SQLCHAR,
-    _pk_cat_len: SQLSMALLINT,
-    _pk_sch: *const SQLCHAR,
-    _pk_sch_len: SQLSMALLINT,
-    _pk_tbl: *const SQLCHAR,
-    _pk_tbl_len: SQLSMALLINT,
-    _fk_cat: *const SQLCHAR,
-    _fk_cat_len: SQLSMALLINT,
-    _fk_sch: *const SQLCHAR,
-    _fk_sch_len: SQLSMALLINT,
-    _fk_tbl: *const SQLCHAR,
-    _fk_tbl_len: SQLSMALLINT,
+    pk_cat: *const SQLCHAR,
+    pk_cat_len: SQLSMALLINT,
+    pk_sch: *const SQLCHAR,
+    pk_sch_len: SQLSMALLINT,
+    pk_tbl: *const SQLCHAR,
+    pk_tbl_len: SQLSMALLINT,
+    fk_cat: *const SQLCHAR,
+    fk_cat_len: SQLSMALLINT,
+    fk_sch: *const SQLCHAR,
+    fk_sch_len: SQLSMALLINT,
+    fk_tbl: *const SQLCHAR,
+    fk_tbl_len: SQLSMALLINT,
 ) -> SQLRETURN {
     if hstmt.is_null() {
         return SQL_INVALID_HANDLE;
     }
     let stmt = unsafe { &mut *(hstmt as *mut Statement) };
-    stmt.columns.clear();
-    stmt.rows.clear();
-    stmt.row_index = -1;
-    stmt.executed = true;
-    SQL_SUCCESS
+    stmt.diagnostics.clear();
+    let pkc = unsafe { sql_str(pk_cat, pk_cat_len) };
+    let pks = unsafe { sql_str(pk_sch, pk_sch_len) };
+    let pkt = unsafe { sql_str(pk_tbl, pk_tbl_len) };
+    let fkc = unsafe { sql_str(fk_cat, fk_cat_len) };
+    let fks = unsafe { sql_str(fk_sch, fk_sch_len) };
+    let fkt = unsafe { sql_str(fk_tbl, fk_tbl_len) };
+    catalog::foreign_keys(stmt, &pkc, &pks, &pkt, &fkc, &fks, &fkt)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn SQLForeignKeysW(
     hstmt: SQLHSTMT,
-    _pk_cat: *const SQLWCHAR,
-    _pk_cat_len: SQLSMALLINT,
-    _pk_sch: *const SQLWCHAR,
-    _pk_sch_len: SQLSMALLINT,
-    _pk_tbl: *const SQLWCHAR,
-    _pk_tbl_len: SQLSMALLINT,
-    _fk_cat: *const SQLWCHAR,
-    _fk_cat_len: SQLSMALLINT,
-    _fk_sch: *const SQLWCHAR,
-    _fk_sch_len: SQLSMALLINT,
-    _fk_tbl: *const SQLWCHAR,
-    _fk_tbl_len: SQLSMALLINT,
+    pk_cat: *const SQLWCHAR,
+    pk_cat_len: SQLSMALLINT,
+    pk_sch: *const SQLWCHAR,
+    pk_sch_len: SQLSMALLINT,
+    pk_tbl: *const SQLWCHAR,
+    pk_tbl_len: SQLSMALLINT,
+    fk_cat: *const SQLWCHAR,
+    fk_cat_len: SQLSMALLINT,
+    fk_sch: *const SQLWCHAR,
+    fk_sch_len: SQLSMALLINT,
+    fk_tbl: *const SQLWCHAR,
+    fk_tbl_len: SQLSMALLINT,
 ) -> SQLRETURN {
-    SQLForeignKeys(
-        hstmt,
-        ptr::null(),
-        0,
-        ptr::null(),
-        0,
-        ptr::null(),
-        0,
-        ptr::null(),
-        0,
-        ptr::null(),
-        0,
-        ptr::null(),
-        0,
-    )
+    if hstmt.is_null() {
+        return SQL_INVALID_HANDLE;
+    }
+    let stmt = unsafe { &mut *(hstmt as *mut Statement) };
+    stmt.diagnostics.clear();
+    let pkc = wchar_to_string(pk_cat, pk_cat_len);
+    let pks = wchar_to_string(pk_sch, pk_sch_len);
+    let pkt = wchar_to_string(pk_tbl, pk_tbl_len);
+    let fkc = wchar_to_string(fk_cat, fk_cat_len);
+    let fks = wchar_to_string(fk_sch, fk_sch_len);
+    let fkt = wchar_to_string(fk_tbl, fk_tbl_len);
+    catalog::foreign_keys(stmt, &pkc, &pks, &pkt, &fkc, &fks, &fkt)
 }
 
 #[unsafe(no_mangle)]
