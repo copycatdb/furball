@@ -116,7 +116,9 @@ jobs:
           cmake ..
           make -j$(nproc)
       - name: Run Google Tests
-        run: cd tests/build && ./furball_tests --gtest_output=xml:test_results.xml
+        run: |
+          source <(cargo llvm-cov show-env --export-prefix)
+          cd tests/build && ./furball_tests --gtest_output=xml:test_results.xml
       - name: Generate coverage report
         run: |
           source <(cargo llvm-cov show-env --export-prefix)
