@@ -49,23 +49,47 @@ pub fn exec_direct(stmt: &mut Statement, sql: &str) -> SQLRETURN {
 
     match result {
         Ok(()) => {
-            stmt.columns = writer.columns;
-            stmt.rows = writer.rows;
+            writer.finalize();
+            // Pop the first result set as the current one
+            let first = if !writer.result_sets.is_empty() {
+                Some(writer.result_sets.remove(0))
+            } else {
+                None
+            };
+            if let Some(rs) = first {
+                stmt.columns = rs.columns;
+                stmt.rows = rs.rows;
+                stmt.row_count = if stmt.columns.is_empty() {
+                    if rs.done_rows == 0 {
+                        -1
+                    } else {
+                        rs.done_rows as SQLLEN
+                    }
+                } else {
+                    -1
+                };
+            } else {
+                stmt.columns = Vec::new();
+                stmt.rows = Vec::new();
+                stmt.row_count = -1;
+            }
+            stmt.pending_result_sets = writer.result_sets;
             stmt.row_index = -1;
             stmt.executed = true;
             stmt.read_offsets.clear();
-            // For SELECT (has columns), row_count is -1 (unknown per ODBC spec)
-            // For DML (no columns), use the done_rows from the Done token
-            stmt.row_count = if stmt.columns.is_empty() {
-                if writer.done_rows == 0 {
-                    -1 // DDL or statement with no affected rows
-                } else {
-                    writer.done_rows as SQLLEN
+            // Transfer info messages to diagnostics
+            if !writer.info_messages.is_empty() {
+                for (number, message) in &writer.info_messages {
+                    stmt.diagnostics.push(DiagRecord {
+                        state: "01000".to_string(),
+                        native_error: *number as i32,
+                        message: message.clone(),
+                    });
                 }
+                SQL_SUCCESS_WITH_INFO
             } else {
-                -1
-            };
-            SQL_SUCCESS
+                SQL_SUCCESS
+            }
         }
         Err(msg) => {
             let (state, native) = map_sqlstate(&msg);

@@ -148,6 +148,7 @@ fn alloc_handle_impl(
                 dae_current_idx: 0,
                 dae_collected: Vec::new(),
                 dae_current_buf: Vec::new(),
+                pending_result_sets: Vec::new(),
             });
             let stmt_ptr = Box::into_raw(stmt);
             if !input_handle.is_null() {
@@ -225,6 +226,7 @@ pub extern "C" fn SQLFreeStmt(hstmt: SQLHSTMT, option: SQLUSMALLINT) -> SQLRETUR
             stmt.executed = false;
             stmt.row_count = -1;
             stmt.read_offsets.clear();
+            stmt.pending_result_sets.clear();
             SQL_SUCCESS
         }
         SQL_UNBIND | SQL_RESET_PARAMS => {
@@ -1610,7 +1612,25 @@ pub extern "C" fn SQLMoreResults(hstmt: SQLHSTMT) -> SQLRETURN {
     if hstmt.is_null() {
         return SQL_INVALID_HANDLE;
     }
-    SQL_NO_DATA
+    let stmt = unsafe { &mut *(hstmt as *mut Statement) };
+    if stmt.pending_result_sets.is_empty() {
+        return SQL_NO_DATA;
+    }
+    let rs = stmt.pending_result_sets.remove(0);
+    stmt.columns = rs.columns;
+    stmt.rows = rs.rows;
+    stmt.row_index = -1;
+    stmt.read_offsets.clear();
+    stmt.row_count = if stmt.columns.is_empty() {
+        if rs.done_rows == 0 {
+            -1
+        } else {
+            rs.done_rows as SQLLEN
+        }
+    } else {
+        -1
+    };
+    SQL_SUCCESS
 }
 
 #[unsafe(no_mangle)]

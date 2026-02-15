@@ -57,6 +57,8 @@ pub struct Statement {
     pub dae_current_idx: usize,  // which dae_params_needed entry we're on
     pub dae_collected: Vec<(u16, String)>, // (param_number, collected_data)
     pub dae_current_buf: Vec<u8>, // buffer for current param being collected via SQLPutData
+    // Multiple result sets
+    pub pending_result_sets: Vec<ResultSet>, // remaining result sets after the current one
 }
 
 /// A bound parameter
@@ -72,23 +74,47 @@ pub struct BoundParam {
     pub len_ind_ptr: *mut SQLLEN,
 }
 
-// RowWriter implementation that collects everything as strings
-pub struct StringRowWriter {
+/// A single result set (columns + rows)
+pub struct ResultSet {
     pub columns: Vec<ColumnDesc>,
     pub rows: Vec<Vec<Option<String>>>,
+    pub done_rows: u64,
+}
+
+// RowWriter implementation that collects everything as strings
+pub struct StringRowWriter {
+    pub result_sets: Vec<ResultSet>,
+    current_columns: Vec<ColumnDesc>,
+    current_rows: Vec<Vec<Option<String>>>,
     current_row: Vec<Option<String>>,
     got_metadata: bool,
     pub done_rows: u64,
+    pub info_messages: Vec<(u32, String)>,
 }
 
 impl StringRowWriter {
     pub fn new() -> Self {
         Self {
-            columns: Vec::new(),
-            rows: Vec::new(),
+            result_sets: Vec::new(),
+            current_columns: Vec::new(),
+            current_rows: Vec::new(),
             current_row: Vec::new(),
             got_metadata: false,
             done_rows: 0,
+            info_messages: Vec::new(),
+        }
+    }
+
+    /// Finalize: flush any pending result set and return all collected result sets
+    pub fn finalize(&mut self) {
+        if self.got_metadata {
+            self.result_sets.push(ResultSet {
+                columns: std::mem::take(&mut self.current_columns),
+                rows: std::mem::take(&mut self.current_rows),
+                done_rows: self.done_rows,
+            });
+            self.got_metadata = false;
+            self.done_rows = 0;
         }
     }
 }
@@ -194,12 +220,17 @@ fn sql_type_from_column(c: &tabby::Column) -> (SQLSMALLINT, SQLULEN, SQLSMALLINT
 
 impl RowWriter for StringRowWriter {
     fn on_metadata(&mut self, columns: &[tabby::Column]) {
-        // Only use the first result set
+        // If we already have a result set in progress, finalize it
         if self.got_metadata {
-            return;
+            self.result_sets.push(ResultSet {
+                columns: std::mem::take(&mut self.current_columns),
+                rows: std::mem::take(&mut self.current_rows),
+                done_rows: self.done_rows,
+            });
+            self.done_rows = 0;
         }
         self.got_metadata = true;
-        self.columns = columns
+        self.current_columns = columns
             .iter()
             .map(|c| {
                 let (sql_type, size, decimal_digits, nullable) = sql_type_from_column(c);
@@ -218,14 +249,18 @@ impl RowWriter for StringRowWriter {
         if self.got_metadata {
             let row = std::mem::replace(
                 &mut self.current_row,
-                Vec::with_capacity(self.columns.len()),
+                Vec::with_capacity(self.current_columns.len()),
             );
-            self.rows.push(row);
+            self.current_rows.push(row);
         }
     }
 
     fn on_done(&mut self, rows: u64) {
         self.done_rows += rows;
+    }
+
+    fn on_info(&mut self, number: u32, message: &str) {
+        self.info_messages.push((number, message.to_string()));
     }
 
     fn write_null(&mut self, _col: usize) {
