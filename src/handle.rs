@@ -1,6 +1,157 @@
 use crate::types::*;
 use tabby::RowWriter;
 
+/// Typed cell value — avoids string round-tripping for native types
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub enum CellValue {
+    Null,
+    Bool(bool),
+    U8(u8),
+    I16(i16),
+    I32(i32),
+    I64(i64),
+    F32(f32),
+    F64(f64),
+    String(String),
+    Bytes(Vec<u8>),
+    Date {
+        days: i32,
+    },
+    Time {
+        nanos: i64,
+    },
+    DateTime {
+        micros: i64,
+    },
+    DateTimeOffset {
+        micros: i64,
+        offset_min: i16,
+    },
+    Decimal {
+        value: i128,
+        precision: u8,
+        scale: u8,
+    },
+    Guid([u8; 16]),
+}
+
+impl CellValue {
+    /// Convert any CellValue to its string representation (for SQL_C_CHAR / SQL_C_WCHAR cross-type)
+    pub fn to_string_repr(&self) -> Option<String> {
+        match self {
+            CellValue::Null => None,
+            CellValue::Bool(v) => Some(if *v { "1".to_string() } else { "0".to_string() }),
+            CellValue::U8(v) => Some(v.to_string()),
+            CellValue::I16(v) => Some(v.to_string()),
+            CellValue::I32(v) => Some(v.to_string()),
+            CellValue::I64(v) => Some(v.to_string()),
+            CellValue::F32(v) => Some(v.to_string()),
+            CellValue::F64(v) => Some(v.to_string()),
+            CellValue::String(s) => Some(s.clone()),
+            CellValue::Bytes(b) => Some(hex::encode(b)),
+            CellValue::Date { days } => Some(format_date(*days)),
+            CellValue::Time { nanos } => Some(format_time(*nanos)),
+            CellValue::DateTime { micros } => Some(format_datetime(*micros)),
+            CellValue::DateTimeOffset { micros, offset_min } => {
+                let mut s = format_datetime(*micros);
+                let sign = if *offset_min >= 0 { "+" } else { "-" };
+                let abs = offset_min.unsigned_abs();
+                s.push_str(&format!(" {}{:02}:{:02}", sign, abs / 60, abs % 60));
+                Some(s)
+            }
+            CellValue::Decimal { value, scale, .. } => Some(format_decimal(*value, *scale)),
+            CellValue::Guid(bytes) => Some(format_guid_str(bytes)),
+        }
+    }
+}
+
+fn days_to_ymd(days: i32) -> (i32, u32, u32) {
+    let d = days + 719468i32;
+    let era = if d >= 0 { d } else { d - 146096 } / 146097;
+    let doe = (d - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i32 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    (year, m, day)
+}
+
+fn format_date(days: i32) -> String {
+    let (y, m, d) = days_to_ymd(days);
+    format!("{:04}-{:02}-{:02}", y, m, d)
+}
+
+fn format_time(nanos: i64) -> String {
+    let total_secs = (nanos / 1_000_000_000) as u32;
+    let h = total_secs / 3600;
+    let m = (total_secs % 3600) / 60;
+    let s = total_secs % 60;
+    let frac = (nanos % 1_000_000_000) / 1_000_000;
+    format!("{:02}:{:02}:{:02}.{:03}", h, m, s, frac)
+}
+
+pub fn micros_to_timestamp_parts(micros: i64) -> (i32, u32, u32, u32, u32, u32, u32) {
+    let total_secs = micros.div_euclid(1_000_000);
+    let remaining_micros = micros.rem_euclid(1_000_000) as u32;
+    let time_of_day = total_secs.rem_euclid(86400) as u32;
+    let h = time_of_day / 3600;
+    let mi = (time_of_day % 3600) / 60;
+    let sec = time_of_day % 60;
+    let millis = remaining_micros / 1000;
+    let days = total_secs.div_euclid(86400) as i32;
+    let (year, month, day) = days_to_ymd(days);
+    (year, month, day, h, mi, sec, millis)
+}
+
+fn format_datetime(micros: i64) -> String {
+    let (year, m, d, h, mi, sec, millis) = micros_to_timestamp_parts(micros);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+        year, m, d, h, mi, sec, millis
+    )
+}
+
+fn format_decimal(value: i128, scale: u8) -> String {
+    let negative = value < 0;
+    let abs = value.unsigned_abs();
+    let s = abs.to_string();
+    let scale = scale as usize;
+    let result = if scale == 0 {
+        s
+    } else if s.len() <= scale {
+        format!("0.{}{}", "0".repeat(scale - s.len()), s)
+    } else {
+        let (int_part, frac_part) = s.split_at(s.len() - scale);
+        format!("{}.{}", int_part, frac_part)
+    };
+    if negative {
+        format!("-{}", result)
+    } else {
+        result
+    }
+}
+
+fn format_guid_str(bytes: &[u8; 16]) -> String {
+    format!(
+        "{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+        u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        u16::from_be_bytes([bytes[4], bytes[5]]),
+        u16::from_be_bytes([bytes[6], bytes[7]]),
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    )
+}
+
 /// Diagnostic record
 pub struct DiagRecord {
     pub state: String, // 5-char SQLSTATE e.g. "HY000"
@@ -42,8 +193,8 @@ pub struct Connection {
 pub struct Statement {
     pub conn: *mut Connection,
     pub columns: Vec<ColumnDesc>,
-    pub rows: Vec<Vec<Option<String>>>, // all results in memory as strings
-    pub row_index: isize,               // -1 = before first row
+    pub rows: Vec<Vec<CellValue>>,
+    pub row_index: isize, // -1 = before first row
     pub diagnostics: Vec<DiagRecord>,
     pub executed: bool,
     pub prepared_sql: Option<String>,
@@ -77,16 +228,16 @@ pub struct BoundParam {
 /// A single result set (columns + rows)
 pub struct ResultSet {
     pub columns: Vec<ColumnDesc>,
-    pub rows: Vec<Vec<Option<String>>>,
+    pub rows: Vec<Vec<CellValue>>,
     pub done_rows: u64,
 }
 
-// RowWriter implementation that collects everything as strings
+// RowWriter implementation that stores typed values directly
 pub struct StringRowWriter {
     pub result_sets: Vec<ResultSet>,
     current_columns: Vec<ColumnDesc>,
-    current_rows: Vec<Vec<Option<String>>>,
-    current_row: Vec<Option<String>>,
+    current_rows: Vec<Vec<CellValue>>,
+    current_row: Vec<CellValue>,
     got_metadata: bool,
     pub done_rows: u64,
     pub info_messages: Vec<(u32, String)>,
@@ -264,136 +415,64 @@ impl RowWriter for StringRowWriter {
     }
 
     fn write_null(&mut self, _col: usize) {
-        self.current_row.push(None);
+        self.current_row.push(CellValue::Null);
     }
     fn write_bool(&mut self, _col: usize, val: bool) {
-        self.current_row
-            .push(Some(if val { "1" } else { "0" }.to_string()));
+        self.current_row.push(CellValue::Bool(val));
     }
     fn write_u8(&mut self, _col: usize, val: u8) {
-        self.current_row.push(Some(val.to_string()));
+        self.current_row.push(CellValue::U8(val));
     }
     fn write_i16(&mut self, _col: usize, val: i16) {
-        self.current_row.push(Some(val.to_string()));
+        self.current_row.push(CellValue::I16(val));
     }
     fn write_i32(&mut self, _col: usize, val: i32) {
-        self.current_row.push(Some(val.to_string()));
+        self.current_row.push(CellValue::I32(val));
     }
     fn write_i64(&mut self, _col: usize, val: i64) {
-        self.current_row.push(Some(val.to_string()));
+        self.current_row.push(CellValue::I64(val));
     }
     fn write_f32(&mut self, _col: usize, val: f32) {
-        self.current_row.push(Some(val.to_string()));
+        self.current_row.push(CellValue::F32(val));
     }
     fn write_f64(&mut self, _col: usize, val: f64) {
-        self.current_row.push(Some(val.to_string()));
+        self.current_row.push(CellValue::F64(val));
     }
     fn write_str(&mut self, _col: usize, val: &str) {
-        self.current_row.push(Some(val.to_string()));
+        self.current_row.push(CellValue::String(val.to_string()));
     }
     fn write_bytes(&mut self, _col: usize, val: &[u8]) {
-        self.current_row.push(Some(hex::encode(val)));
+        self.current_row.push(CellValue::Bytes(val.to_vec()));
     }
     fn write_date(&mut self, _col: usize, days: i32) {
-        // days since unix epoch
-        let epoch = 719468i32; // days from 0000-03-01 to 1970-01-01
-        let d = days + epoch;
-        let era = if d >= 0 { d } else { d - 146096 } / 146097;
-        let doe = (d - era * 146097) as u32;
-        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-        let y = yoe as i32 + era * 400;
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-        let mp = (5 * doy + 2) / 153;
-        let day = doy - (153 * mp + 2) / 5 + 1;
-        let m = if mp < 10 { mp + 3 } else { mp - 9 };
-        let year = if m <= 2 { y + 1 } else { y };
-        self.current_row
-            .push(Some(format!("{:04}-{:02}-{:02}", year, m, day)));
+        self.current_row.push(CellValue::Date { days });
     }
     fn write_time(&mut self, _col: usize, nanos: i64) {
-        let total_secs = (nanos / 1_000_000_000) as u32;
-        let h = total_secs / 3600;
-        let m = (total_secs % 3600) / 60;
-        let s = total_secs % 60;
-        let frac = (nanos % 1_000_000_000) / 1_000_000;
-        self.current_row
-            .push(Some(format!("{:02}:{:02}:{:02}.{:03}", h, m, s, frac)));
+        self.current_row.push(CellValue::Time { nanos });
     }
     fn write_datetime(&mut self, _col: usize, micros: i64) {
-        let total_secs = micros.div_euclid(1_000_000);
-        let remaining_micros = micros.rem_euclid(1_000_000) as u32;
-        let time_of_day = total_secs.rem_euclid(86400) as u32;
-        let h = time_of_day / 3600;
-        let mi = (time_of_day % 3600) / 60;
-        let sec = time_of_day % 60;
-        let millis = remaining_micros / 1000;
-        let mut days = total_secs.div_euclid(86400) as i32;
-        days += 719468;
-        let era = if days >= 0 { days } else { days - 146096 } / 146097;
-        let doe = (days - era * 146097) as u32;
-        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-        let y = yoe as i32 + era * 400;
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-        let mp = (5 * doy + 2) / 153;
-        let d = doy - (153 * mp + 2) / 5 + 1;
-        let m = if mp < 10 { mp + 3 } else { mp - 9 };
-        let year = if m <= 2 { y + 1 } else { y };
-        self.current_row.push(Some(format!(
-            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
-            year, m, d, h, mi, sec, millis
-        )));
+        self.current_row.push(CellValue::DateTime { micros });
     }
     fn write_datetimeoffset(&mut self, _col: usize, micros: i64, offset_minutes: i16) {
-        // Just write as datetime for now
-        self.write_datetime(_col, micros);
-        // Append offset
-        if let Some(Some(s)) = self.current_row.last_mut() {
-            let sign = if offset_minutes >= 0 { "+" } else { "-" };
-            let abs = offset_minutes.unsigned_abs();
-            s.push_str(&format!(" {}{:02}:{:02}", sign, abs / 60, abs % 60));
-        }
+        self.current_row.push(CellValue::DateTimeOffset {
+            micros,
+            offset_min: offset_minutes,
+        });
     }
-    fn write_decimal(&mut self, _col: usize, value: i128, _precision: u8, scale: u8) {
-        let negative = value < 0;
-        let abs = value.unsigned_abs();
-        let s = abs.to_string();
-        let scale = scale as usize;
-        let result = if scale == 0 {
-            s
-        } else if s.len() <= scale {
-            format!("0.{}{}", "0".repeat(scale - s.len()), s)
-        } else {
-            let (int_part, frac_part) = s.split_at(s.len() - scale);
-            format!("{}.{}", int_part, frac_part)
-        };
-        let result = if negative {
-            format!("-{}", result)
-        } else {
-            result
-        };
-        self.current_row.push(Some(result));
+    fn write_decimal(&mut self, _col: usize, value: i128, precision: u8, scale: u8) {
+        self.current_row.push(CellValue::Decimal {
+            value,
+            precision,
+            scale,
+        });
     }
     fn write_guid(&mut self, _col: usize, bytes: &[u8; 16]) {
-        let fmt = format!(
-            "{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-            u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-            u16::from_be_bytes([bytes[4], bytes[5]]),
-            u16::from_be_bytes([bytes[6], bytes[7]]),
-            bytes[8],
-            bytes[9],
-            bytes[10],
-            bytes[11],
-            bytes[12],
-            bytes[13],
-            bytes[14],
-            bytes[15]
-        );
-        self.current_row.push(Some(fmt));
+        self.current_row.push(CellValue::Guid(*bytes));
     }
 }
 
 // hex encode helper (avoid depending on hex crate)
-mod hex {
+pub(crate) mod hex {
     pub fn encode(data: &[u8]) -> String {
         data.iter().map(|b| format!("{:02x}", b)).collect()
     }

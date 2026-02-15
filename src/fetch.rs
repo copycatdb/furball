@@ -16,6 +16,60 @@ pub fn fetch(stmt: &mut Statement) -> SQLRETURN {
     }
 }
 
+/// Helper: write a fixed-size numeric value to the target buffer
+unsafe fn write_fixed<T: Copy>(
+    target_value: SQLPOINTER,
+    str_len_or_ind: *mut SQLLEN,
+    val: T,
+    read_offsets: &mut [usize],
+    col_idx: usize,
+) -> SQLRETURN {
+    if !target_value.is_null() {
+        *(target_value as *mut T) = val;
+    }
+    if !str_len_or_ind.is_null() {
+        *str_len_or_ind = std::mem::size_of::<T>() as SQLLEN;
+    }
+    read_offsets[col_idx] = 0;
+    SQL_SUCCESS
+}
+
+/// Helper: convert CellValue to i64 for numeric cross-type conversions
+fn cell_to_i64(cell: &CellValue) -> i64 {
+    match cell {
+        CellValue::Bool(v) => *v as i64,
+        CellValue::U8(v) => *v as i64,
+        CellValue::I16(v) => *v as i64,
+        CellValue::I32(v) => *v as i64,
+        CellValue::I64(v) => *v,
+        CellValue::F32(v) => *v as i64,
+        CellValue::F64(v) => *v as i64,
+        CellValue::String(s) => s.parse().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn cell_to_f64(cell: &CellValue) -> f64 {
+    match cell {
+        CellValue::Bool(v) => {
+            if *v {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        CellValue::U8(v) => *v as f64,
+        CellValue::I16(v) => *v as f64,
+        CellValue::I32(v) => *v as f64,
+        CellValue::I64(v) => *v as f64,
+        CellValue::F32(v) => *v as f64,
+        CellValue::F64(v) => *v,
+        CellValue::String(s) => s.parse().unwrap_or(0.0),
+        CellValue::Decimal { value, scale, .. } => *value as f64 / 10f64.powi(*scale as i32),
+        _ => 0.0,
+    }
+}
+
 pub fn get_data(
     stmt: &mut Statement,
     col: SQLUSMALLINT,
@@ -38,381 +92,484 @@ pub fn get_data(
         stmt.read_offsets.push(0);
     }
 
-    match &row[col_idx] {
-        None => {
-            if !str_len_or_ind.is_null() {
+    let cell = &row[col_idx];
+
+    // Handle NULL
+    if matches!(cell, CellValue::Null) {
+        if !str_len_or_ind.is_null() {
+            unsafe {
+                *str_len_or_ind = SQL_NULL_DATA;
+            }
+        }
+        stmt.read_offsets[col_idx] = 0;
+        return SQL_SUCCESS;
+    }
+
+    // Determine effective target type
+    let eff_type = if target_type == SQL_C_DEFAULT {
+        if col_idx < stmt.columns.len() {
+            match stmt.columns[col_idx].sql_type {
+                SQL_INTEGER => SQL_C_LONG,
+                SQL_SMALLINT => SQL_C_SHORT,
+                SQL_BIGINT => SQL_C_SBIGINT,
+                SQL_DOUBLE | SQL_FLOAT => SQL_C_DOUBLE,
+                SQL_REAL => SQL_C_FLOAT,
+                SQL_BIT => SQL_C_BIT,
+                SQL_TYPE_TIMESTAMP => SQL_C_TYPE_TIMESTAMP,
+                SQL_TYPE_DATE => SQL_C_TYPE_DATE,
+                SQL_TYPE_TIME => SQL_C_TYPE_TIME,
+                SQL_BINARY | SQL_VARBINARY | SQL_LONGVARBINARY => SQL_C_BINARY,
+                SQL_GUID => SQL_C_GUID,
+                SQL_TINYINT => SQL_C_UTINYINT,
+                _ => SQL_C_CHAR,
+            }
+        } else {
+            SQL_C_CHAR
+        }
+    } else {
+        target_type
+    };
+
+    match eff_type {
+        SQL_C_LONG | SQL_C_SLONG => {
+            let v: i32 = match cell {
+                CellValue::I32(v) => *v,
+                CellValue::Bool(v) => *v as i32,
+                CellValue::U8(v) => *v as i32,
+                CellValue::I16(v) => *v as i32,
+                _ => cell_to_i64(cell) as i32,
+            };
+            unsafe {
+                write_fixed(
+                    target_value,
+                    str_len_or_ind,
+                    v,
+                    &mut stmt.read_offsets,
+                    col_idx,
+                )
+            }
+        }
+        SQL_C_SHORT => {
+            let v: i16 = match cell {
+                CellValue::I16(v) => *v,
+                _ => cell_to_i64(cell) as i16,
+            };
+            unsafe {
+                write_fixed(
+                    target_value,
+                    str_len_or_ind,
+                    v,
+                    &mut stmt.read_offsets,
+                    col_idx,
+                )
+            }
+        }
+        SQL_C_SBIGINT => {
+            let v: i64 = match cell {
+                CellValue::I64(v) => *v,
+                _ => cell_to_i64(cell),
+            };
+            unsafe {
+                write_fixed(
+                    target_value,
+                    str_len_or_ind,
+                    v,
+                    &mut stmt.read_offsets,
+                    col_idx,
+                )
+            }
+        }
+        SQL_C_DOUBLE => {
+            let v: f64 = match cell {
+                CellValue::F64(v) => *v,
+                _ => cell_to_f64(cell),
+            };
+            unsafe {
+                write_fixed(
+                    target_value,
+                    str_len_or_ind,
+                    v,
+                    &mut stmt.read_offsets,
+                    col_idx,
+                )
+            }
+        }
+        SQL_C_FLOAT => {
+            let v: f32 = match cell {
+                CellValue::F32(v) => *v,
+                _ => cell_to_f64(cell) as f32,
+            };
+            unsafe {
+                write_fixed(
+                    target_value,
+                    str_len_or_ind,
+                    v,
+                    &mut stmt.read_offsets,
+                    col_idx,
+                )
+            }
+        }
+        SQL_C_BIT => {
+            let v: u8 = match cell {
+                CellValue::Bool(b) => {
+                    if *b {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                CellValue::U8(v) => {
+                    if *v != 0 {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                CellValue::String(s) => {
+                    if s == "0" || s.is_empty() {
+                        0
+                    } else {
+                        1
+                    }
+                }
+                _ => {
+                    if cell_to_i64(cell) != 0 {
+                        1
+                    } else {
+                        0
+                    }
+                }
+            };
+            unsafe {
+                write_fixed(
+                    target_value,
+                    str_len_or_ind,
+                    v,
+                    &mut stmt.read_offsets,
+                    col_idx,
+                )
+            }
+        }
+        SQL_C_UTINYINT | SQL_C_STINYINT => {
+            let v: u8 = match cell {
+                CellValue::U8(v) => *v,
+                _ => cell_to_i64(cell) as u8,
+            };
+            unsafe {
+                write_fixed(
+                    target_value,
+                    str_len_or_ind,
+                    v,
+                    &mut stmt.read_offsets,
+                    col_idx,
+                )
+            }
+        }
+        SQL_C_WCHAR => {
+            // Convert to string, then UTF-16
+            let val = cell.to_string_repr().unwrap_or_default();
+            let utf16: Vec<u16> = val.encode_utf16().collect();
+            let total_bytes = (utf16.len() * 2) as SQLLEN;
+            let offset = stmt.read_offsets[col_idx]; // offset in u16 units
+            let remaining_u16 = if offset < utf16.len() {
+                &utf16[offset..]
+            } else {
+                if !str_len_or_ind.is_null() {
+                    unsafe {
+                        *str_len_or_ind = 0;
+                    }
+                }
+                stmt.read_offsets[col_idx] = 0;
+                return SQL_NO_DATA;
+            };
+
+            if offset == 0 {
+                if !str_len_or_ind.is_null() {
+                    unsafe {
+                        *str_len_or_ind = total_bytes;
+                    }
+                }
+            } else if !str_len_or_ind.is_null() {
                 unsafe {
-                    *str_len_or_ind = SQL_NULL_DATA;
+                    *str_len_or_ind = (remaining_u16.len() * 2) as SQLLEN;
+                }
+            }
+
+            if !target_value.is_null() && buffer_length > 0 {
+                let buf_u16_cap = (buffer_length as usize) / 2;
+                let copy_count = std::cmp::min(remaining_u16.len(), buf_u16_cap.saturating_sub(1));
+                let dest = target_value as *mut u16;
+                unsafe {
+                    ptr::copy_nonoverlapping(remaining_u16.as_ptr(), dest, copy_count);
+                    *dest.add(copy_count) = 0;
+                }
+                stmt.read_offsets[col_idx] = offset + copy_count;
+                if remaining_u16.len() > copy_count {
+                    return SQL_SUCCESS_WITH_INFO;
                 }
             }
             stmt.read_offsets[col_idx] = 0;
             SQL_SUCCESS
         }
-        Some(val) => {
-            // Determine effective target type
-            let eff_type = if target_type == SQL_C_DEFAULT {
-                // Use column's SQL type to pick a C type
-                if col_idx < stmt.columns.len() {
-                    match stmt.columns[col_idx].sql_type {
-                        SQL_INTEGER => SQL_C_LONG,
-                        SQL_SMALLINT => SQL_C_SHORT,
-                        SQL_BIGINT => SQL_C_SBIGINT,
-                        SQL_DOUBLE | SQL_FLOAT => SQL_C_DOUBLE,
-                        SQL_REAL => SQL_C_FLOAT,
-                        SQL_BIT => SQL_C_BIT,
-                        SQL_TYPE_TIMESTAMP => SQL_C_TYPE_TIMESTAMP,
-                        SQL_TYPE_DATE => SQL_C_TYPE_DATE,
-                        SQL_TYPE_TIME => SQL_C_TYPE_TIME,
-                        SQL_BINARY | SQL_VARBINARY | SQL_LONGVARBINARY => SQL_C_BINARY,
-                        SQL_GUID => SQL_C_GUID,
-                        SQL_TINYINT => SQL_C_UTINYINT,
-                        _ => SQL_C_CHAR,
+        SQL_C_TYPE_TIMESTAMP => {
+            let ts = match cell {
+                CellValue::DateTime { micros } => {
+                    let (year, month, day, h, mi, sec, millis) = micros_to_timestamp_parts(*micros);
+                    SqlTimestampStruct {
+                        year: year as i16,
+                        month: month as u16,
+                        day: day as u16,
+                        hour: h as u16,
+                        minute: mi as u16,
+                        second: sec as u16,
+                        fraction: millis * 1_000_000, // millis -> nanoseconds
                     }
-                } else {
-                    SQL_C_CHAR
                 }
-            } else {
-                target_type
-            };
-
-            // Clone val to avoid borrow issues with stmt
-            let val = val.clone();
-
-            match eff_type {
-                SQL_C_LONG | SQL_C_SLONG => {
-                    let v: i32 = val.parse().unwrap_or(0);
-                    if !target_value.is_null() {
-                        unsafe {
-                            *(target_value as *mut i32) = v;
-                        }
+                CellValue::DateTimeOffset { micros, .. } => {
+                    let (year, month, day, h, mi, sec, millis) = micros_to_timestamp_parts(*micros);
+                    SqlTimestampStruct {
+                        year: year as i16,
+                        month: month as u16,
+                        day: day as u16,
+                        hour: h as u16,
+                        minute: mi as u16,
+                        second: sec as u16,
+                        fraction: millis * 1_000_000,
                     }
-                    if !str_len_or_ind.is_null() {
-                        unsafe {
-                            *str_len_or_ind = 4;
-                        }
-                    }
-                    stmt.read_offsets[col_idx] = 0;
-                    SQL_SUCCESS
                 }
-                SQL_C_SHORT => {
-                    let v: i16 = val.parse().unwrap_or(0);
-                    if !target_value.is_null() {
-                        unsafe {
-                            *(target_value as *mut i16) = v;
-                        }
-                    }
-                    if !str_len_or_ind.is_null() {
-                        unsafe {
-                            *str_len_or_ind = 2;
-                        }
-                    }
-                    stmt.read_offsets[col_idx] = 0;
-                    SQL_SUCCESS
-                }
-                SQL_C_SBIGINT => {
-                    let v: i64 = val.parse().unwrap_or(0);
-                    if !target_value.is_null() {
-                        unsafe {
-                            *(target_value as *mut i64) = v;
-                        }
-                    }
-                    if !str_len_or_ind.is_null() {
-                        unsafe {
-                            *str_len_or_ind = 8;
-                        }
-                    }
-                    stmt.read_offsets[col_idx] = 0;
-                    SQL_SUCCESS
-                }
-                SQL_C_DOUBLE => {
-                    let v: f64 = val.parse().unwrap_or(0.0);
-                    if !target_value.is_null() {
-                        unsafe {
-                            *(target_value as *mut f64) = v;
-                        }
-                    }
-                    if !str_len_or_ind.is_null() {
-                        unsafe {
-                            *str_len_or_ind = 8;
-                        }
-                    }
-                    stmt.read_offsets[col_idx] = 0;
-                    SQL_SUCCESS
-                }
-                SQL_C_FLOAT => {
-                    let v: f32 = val.parse().unwrap_or(0.0);
-                    if !target_value.is_null() {
-                        unsafe {
-                            *(target_value as *mut f32) = v;
-                        }
-                    }
-                    if !str_len_or_ind.is_null() {
-                        unsafe {
-                            *str_len_or_ind = 4;
-                        }
-                    }
-                    stmt.read_offsets[col_idx] = 0;
-                    SQL_SUCCESS
-                }
-                SQL_C_WCHAR => {
-                    // UTF-16 with chunked read support
-                    let utf16: Vec<u16> = val.encode_utf16().collect();
-                    let total_bytes = (utf16.len() * 2) as SQLLEN;
-                    let offset = stmt.read_offsets[col_idx]; // offset in u16 units
-                    let remaining_u16 = if offset < utf16.len() {
-                        &utf16[offset..]
-                    } else {
-                        // All data already returned
-                        if !str_len_or_ind.is_null() {
-                            unsafe {
-                                *str_len_or_ind = 0;
-                            }
-                        }
-                        stmt.read_offsets[col_idx] = 0;
-                        return SQL_NO_DATA;
-                    };
-
-                    let remaining_bytes = (remaining_u16.len() * 2) as SQLLEN;
-
-                    if offset == 0 {
-                        // First call: report full length
-                        if !str_len_or_ind.is_null() {
-                            unsafe {
-                                *str_len_or_ind = total_bytes;
-                            }
-                        }
-                    } else {
-                        // Subsequent call: report remaining
-                        if !str_len_or_ind.is_null() {
-                            unsafe {
-                                *str_len_or_ind = remaining_bytes;
-                            }
-                        }
-                    }
-
-                    if !target_value.is_null() && buffer_length > 0 {
-                        let buf_u16_cap = (buffer_length as usize) / 2;
-                        let copy_count =
-                            std::cmp::min(remaining_u16.len(), buf_u16_cap.saturating_sub(1));
-                        let dest = target_value as *mut u16;
-                        unsafe {
-                            ptr::copy_nonoverlapping(remaining_u16.as_ptr(), dest, copy_count);
-                            *dest.add(copy_count) = 0;
-                        }
-                        stmt.read_offsets[col_idx] = offset + copy_count;
-                        if remaining_u16.len() > copy_count {
-                            return SQL_SUCCESS_WITH_INFO;
-                        }
-                    }
-                    // Done, reset offset
-                    stmt.read_offsets[col_idx] = 0;
-                    SQL_SUCCESS
-                }
-                SQL_C_BIT => {
-                    let v: u8 = if val == "0" || val.is_empty() { 0 } else { 1 };
-                    if !target_value.is_null() {
-                        unsafe {
-                            *(target_value as *mut u8) = v;
-                        }
-                    }
-                    if !str_len_or_ind.is_null() {
-                        unsafe {
-                            *str_len_or_ind = 1;
-                        }
-                    }
-                    stmt.read_offsets[col_idx] = 0;
-                    SQL_SUCCESS
-                }
-                SQL_C_UTINYINT | SQL_C_STINYINT => {
-                    let v: u8 = val.parse().unwrap_or(0);
-                    if !target_value.is_null() {
-                        unsafe {
-                            *(target_value as *mut u8) = v;
-                        }
-                    }
-                    if !str_len_or_ind.is_null() {
-                        unsafe {
-                            *str_len_or_ind = 1;
-                        }
-                    }
-                    stmt.read_offsets[col_idx] = 0;
-                    SQL_SUCCESS
-                }
-                SQL_C_TYPE_TIMESTAMP => {
-                    let ts = parse_timestamp(&val);
-                    if !target_value.is_null() {
-                        unsafe {
-                            *(target_value as *mut SqlTimestampStruct) = ts;
-                        }
-                    }
-                    if !str_len_or_ind.is_null() {
-                        unsafe {
-                            *str_len_or_ind = std::mem::size_of::<SqlTimestampStruct>() as SQLLEN;
-                        }
-                    }
-                    stmt.read_offsets[col_idx] = 0;
-                    SQL_SUCCESS
-                }
-                SQL_C_TYPE_DATE => {
-                    let ts = parse_timestamp(&val);
-                    if !target_value.is_null() {
-                        unsafe {
-                            let d = target_value as *mut SqlDateStruct;
-                            (*d).year = ts.year;
-                            (*d).month = ts.month;
-                            (*d).day = ts.day;
-                        }
-                    }
-                    if !str_len_or_ind.is_null() {
-                        unsafe {
-                            *str_len_or_ind = std::mem::size_of::<SqlDateStruct>() as SQLLEN;
-                        }
-                    }
-                    stmt.read_offsets[col_idx] = 0;
-                    SQL_SUCCESS
-                }
-                SQL_C_TYPE_TIME => {
-                    let ts = parse_timestamp(&val);
-                    if !target_value.is_null() {
-                        unsafe {
-                            let t = target_value as *mut SqlTimeStruct;
-                            (*t).hour = ts.hour;
-                            (*t).minute = ts.minute;
-                            (*t).second = ts.second;
-                        }
-                    }
-                    if !str_len_or_ind.is_null() {
-                        unsafe {
-                            *str_len_or_ind = std::mem::size_of::<SqlTimeStruct>() as SQLLEN;
-                        }
-                    }
-                    stmt.read_offsets[col_idx] = 0;
-                    SQL_SUCCESS
-                }
-                SQL_C_BINARY => {
-                    // val is hex-encoded for binary, raw bytes for strings
-                    let bytes = if val.chars().all(|c| c.is_ascii_hexdigit()) && val.len() % 2 == 0
-                    {
-                        hex_decode(&val)
-                    } else {
-                        val.as_bytes().to_vec()
-                    };
-                    let offset = stmt.read_offsets[col_idx];
-                    let remaining = if offset < bytes.len() {
-                        &bytes[offset..]
-                    } else {
-                        if !str_len_or_ind.is_null() {
-                            unsafe {
-                                *str_len_or_ind = 0;
-                            }
-                        }
-                        stmt.read_offsets[col_idx] = 0;
-                        return SQL_NO_DATA;
-                    };
-
-                    let remaining_len = remaining.len() as SQLLEN;
-                    if offset == 0 {
-                        if !str_len_or_ind.is_null() {
-                            unsafe {
-                                *str_len_or_ind = bytes.len() as SQLLEN;
-                            }
-                        }
-                    } else if !str_len_or_ind.is_null() {
-                        unsafe {
-                            *str_len_or_ind = remaining_len;
-                        }
-                    }
-
-                    if !target_value.is_null() && buffer_length > 0 {
-                        let copy_len = std::cmp::min(remaining_len, buffer_length) as usize;
-                        unsafe {
-                            ptr::copy_nonoverlapping(
-                                remaining.as_ptr(),
-                                target_value as *mut u8,
-                                copy_len,
-                            );
-                        }
-                        stmt.read_offsets[col_idx] = offset + copy_len;
-                        if remaining.len() > copy_len {
-                            return SQL_SUCCESS_WITH_INFO;
-                        }
-                    }
-                    stmt.read_offsets[col_idx] = 0;
-                    SQL_SUCCESS
-                }
-                SQL_C_GUID => {
-                    let guid = parse_guid(&val);
-                    if !target_value.is_null() {
-                        unsafe {
-                            *(target_value as *mut SqlGuid) = guid;
-                        }
-                    }
-                    if !str_len_or_ind.is_null() {
-                        unsafe {
-                            *str_len_or_ind = 16;
-                        }
-                    }
-                    stmt.read_offsets[col_idx] = 0;
-                    SQL_SUCCESS
+                CellValue::Date { .. } => {
+                    let s = cell.to_string_repr().unwrap_or_default();
+                    parse_timestamp(&s)
                 }
                 _ => {
-                    // SQL_C_CHAR or unknown: return as ANSI string with chunked read support
-                    let bytes = val.as_bytes();
-                    let offset = stmt.read_offsets[col_idx];
-
-                    let remaining = if offset < bytes.len() {
-                        &bytes[offset..]
-                    } else if offset > 0 {
-                        // All data already returned
-                        if !str_len_or_ind.is_null() {
-                            unsafe {
-                                *str_len_or_ind = 0;
-                            }
-                        }
-                        stmt.read_offsets[col_idx] = 0;
-                        return SQL_NO_DATA;
-                    } else {
-                        bytes
-                    };
-
-                    let remaining_len = remaining.len() as SQLLEN;
-
-                    if offset == 0 {
-                        // First call: report full data length
-                        if !str_len_or_ind.is_null() {
-                            unsafe {
-                                *str_len_or_ind = bytes.len() as SQLLEN;
-                            }
-                        }
-                    } else {
-                        // Subsequent call: report remaining length
-                        if !str_len_or_ind.is_null() {
-                            unsafe {
-                                *str_len_or_ind = remaining_len;
-                            }
-                        }
-                    }
-
-                    if !target_value.is_null() && buffer_length > 0 {
-                        let copy_len = std::cmp::min(remaining_len, buffer_length - 1) as usize;
-                        unsafe {
-                            ptr::copy_nonoverlapping(
-                                remaining.as_ptr(),
-                                target_value as *mut u8,
-                                copy_len,
-                            );
-                            *((target_value as *mut u8).add(copy_len)) = 0;
-                        }
-                        stmt.read_offsets[col_idx] = offset + copy_len;
-                        if remaining.len() > copy_len {
-                            return SQL_SUCCESS_WITH_INFO;
-                        }
-                    }
-                    // Done reading this column
-                    stmt.read_offsets[col_idx] = 0;
-                    SQL_SUCCESS
+                    let s = cell.to_string_repr().unwrap_or_default();
+                    parse_timestamp(&s)
+                }
+            };
+            if !target_value.is_null() {
+                unsafe {
+                    *(target_value as *mut SqlTimestampStruct) = ts;
                 }
             }
+            if !str_len_or_ind.is_null() {
+                unsafe {
+                    *str_len_or_ind = std::mem::size_of::<SqlTimestampStruct>() as SQLLEN;
+                }
+            }
+            stmt.read_offsets[col_idx] = 0;
+            SQL_SUCCESS
+        }
+        SQL_C_TYPE_DATE => {
+            let ts = match cell {
+                CellValue::DateTime { micros } | CellValue::DateTimeOffset { micros, .. } => {
+                    let (year, month, day, ..) = micros_to_timestamp_parts(*micros);
+                    SqlDateStruct {
+                        year: year as i16,
+                        month: month as u16,
+                        day: day as u16,
+                    }
+                }
+                CellValue::Date { .. } => {
+                    let s = cell.to_string_repr().unwrap_or_default();
+                    let ts = parse_timestamp(&s);
+                    SqlDateStruct {
+                        year: ts.year,
+                        month: ts.month,
+                        day: ts.day,
+                    }
+                }
+                _ => {
+                    let s = cell.to_string_repr().unwrap_or_default();
+                    let ts = parse_timestamp(&s);
+                    SqlDateStruct {
+                        year: ts.year,
+                        month: ts.month,
+                        day: ts.day,
+                    }
+                }
+            };
+            if !target_value.is_null() {
+                unsafe {
+                    *(target_value as *mut SqlDateStruct) = ts;
+                }
+            }
+            if !str_len_or_ind.is_null() {
+                unsafe {
+                    *str_len_or_ind = std::mem::size_of::<SqlDateStruct>() as SQLLEN;
+                }
+            }
+            stmt.read_offsets[col_idx] = 0;
+            SQL_SUCCESS
+        }
+        SQL_C_TYPE_TIME => {
+            let ts = match cell {
+                CellValue::Time { nanos } => {
+                    let total_secs = (*nanos / 1_000_000_000) as u32;
+                    SqlTimeStruct {
+                        hour: (total_secs / 3600) as u16,
+                        minute: ((total_secs % 3600) / 60) as u16,
+                        second: (total_secs % 60) as u16,
+                    }
+                }
+                CellValue::DateTime { micros } | CellValue::DateTimeOffset { micros, .. } => {
+                    let (_, _, _, h, mi, sec, _) = micros_to_timestamp_parts(*micros);
+                    SqlTimeStruct {
+                        hour: h as u16,
+                        minute: mi as u16,
+                        second: sec as u16,
+                    }
+                }
+                _ => {
+                    let s = cell.to_string_repr().unwrap_or_default();
+                    let ts = parse_timestamp(&s);
+                    SqlTimeStruct {
+                        hour: ts.hour,
+                        minute: ts.minute,
+                        second: ts.second,
+                    }
+                }
+            };
+            if !target_value.is_null() {
+                unsafe {
+                    *(target_value as *mut SqlTimeStruct) = ts;
+                }
+            }
+            if !str_len_or_ind.is_null() {
+                unsafe {
+                    *str_len_or_ind = std::mem::size_of::<SqlTimeStruct>() as SQLLEN;
+                }
+            }
+            stmt.read_offsets[col_idx] = 0;
+            SQL_SUCCESS
+        }
+        SQL_C_BINARY => {
+            let bytes: Vec<u8> = match cell {
+                CellValue::Bytes(b) => b.clone(),
+                CellValue::Guid(g) => g.to_vec(),
+                _ => {
+                    let s = cell.to_string_repr().unwrap_or_default();
+                    if s.chars().all(|c| c.is_ascii_hexdigit()) && s.len() % 2 == 0 {
+                        hex_decode(&s)
+                    } else {
+                        s.into_bytes()
+                    }
+                }
+            };
+            let offset = stmt.read_offsets[col_idx];
+            let remaining = if offset < bytes.len() {
+                &bytes[offset..]
+            } else {
+                if !str_len_or_ind.is_null() {
+                    unsafe {
+                        *str_len_or_ind = 0;
+                    }
+                }
+                stmt.read_offsets[col_idx] = 0;
+                return SQL_NO_DATA;
+            };
+
+            let remaining_len = remaining.len() as SQLLEN;
+            if offset == 0 {
+                if !str_len_or_ind.is_null() {
+                    unsafe {
+                        *str_len_or_ind = bytes.len() as SQLLEN;
+                    }
+                }
+            } else if !str_len_or_ind.is_null() {
+                unsafe {
+                    *str_len_or_ind = remaining_len;
+                }
+            }
+
+            if !target_value.is_null() && buffer_length > 0 {
+                let copy_len = std::cmp::min(remaining_len, buffer_length) as usize;
+                unsafe {
+                    ptr::copy_nonoverlapping(remaining.as_ptr(), target_value as *mut u8, copy_len);
+                }
+                stmt.read_offsets[col_idx] = offset + copy_len;
+                if remaining.len() > copy_len {
+                    return SQL_SUCCESS_WITH_INFO;
+                }
+            }
+            stmt.read_offsets[col_idx] = 0;
+            SQL_SUCCESS
+        }
+        SQL_C_GUID => {
+            let guid = match cell {
+                CellValue::Guid(bytes) => SqlGuid {
+                    data1: u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+                    data2: u16::from_be_bytes([bytes[4], bytes[5]]),
+                    data3: u16::from_be_bytes([bytes[6], bytes[7]]),
+                    data4: [
+                        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14],
+                        bytes[15],
+                    ],
+                },
+                _ => {
+                    let s = cell.to_string_repr().unwrap_or_default();
+                    parse_guid(&s)
+                }
+            };
+            if !target_value.is_null() {
+                unsafe {
+                    *(target_value as *mut SqlGuid) = guid;
+                }
+            }
+            if !str_len_or_ind.is_null() {
+                unsafe {
+                    *str_len_or_ind = 16;
+                }
+            }
+            stmt.read_offsets[col_idx] = 0;
+            SQL_SUCCESS
+        }
+        _ => {
+            // SQL_C_CHAR or unknown: return as ANSI string with chunked read support
+            let val = cell.to_string_repr().unwrap_or_default();
+            let bytes = val.as_bytes();
+            let offset = stmt.read_offsets[col_idx];
+
+            let remaining = if offset < bytes.len() {
+                &bytes[offset..]
+            } else if offset > 0 {
+                if !str_len_or_ind.is_null() {
+                    unsafe {
+                        *str_len_or_ind = 0;
+                    }
+                }
+                stmt.read_offsets[col_idx] = 0;
+                return SQL_NO_DATA;
+            } else {
+                bytes
+            };
+
+            let remaining_len = remaining.len() as SQLLEN;
+
+            if offset == 0 {
+                if !str_len_or_ind.is_null() {
+                    unsafe {
+                        *str_len_or_ind = bytes.len() as SQLLEN;
+                    }
+                }
+            } else if !str_len_or_ind.is_null() {
+                unsafe {
+                    *str_len_or_ind = remaining_len;
+                }
+            }
+
+            if !target_value.is_null() && buffer_length > 0 {
+                let copy_len = std::cmp::min(remaining_len, buffer_length - 1) as usize;
+                unsafe {
+                    ptr::copy_nonoverlapping(remaining.as_ptr(), target_value as *mut u8, copy_len);
+                    *((target_value as *mut u8).add(copy_len)) = 0;
+                }
+                stmt.read_offsets[col_idx] = offset + copy_len;
+                if remaining.len() > copy_len {
+                    return SQL_SUCCESS_WITH_INFO;
+                }
+            }
+            stmt.read_offsets[col_idx] = 0;
+            SQL_SUCCESS
         }
     }
 }
