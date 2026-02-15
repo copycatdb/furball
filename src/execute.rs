@@ -17,6 +17,26 @@ pub fn exec_direct(stmt: &mut Statement, sql: &str) -> SQLRETURN {
         }
     };
 
+    // If autocommit is OFF and we're not already in a transaction, start one
+    if !conn.autocommit && !conn.in_transaction {
+        let begin_result = runtime::block_on(async {
+            let mut w = StringRowWriter::new();
+            client
+                .batch_into("BEGIN TRANSACTION", &mut w)
+                .await
+                .map_err(|e| e.to_string())
+        });
+        if let Err(msg) = begin_result {
+            stmt.diagnostics.push(DiagRecord {
+                state: "HY000".to_string(),
+                native_error: 0,
+                message: format!("Failed to begin transaction: {}", msg),
+            });
+            return SQL_ERROR;
+        }
+        conn.in_transaction = true;
+    }
+
     let mut writer = StringRowWriter::new();
     let sql = sql.to_string();
 

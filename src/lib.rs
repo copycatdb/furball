@@ -104,6 +104,8 @@ fn alloc_handle_impl(
                 diagnostics: Vec::new(),
                 statements: Vec::new(),
                 connected: false,
+                autocommit: true,
+                in_transaction: false,
             });
             let conn_ptr = Box::into_raw(conn);
             if !input_handle.is_null() {
@@ -622,8 +624,19 @@ pub extern "C" fn SQLGetConnectAttr(
     if hdbc.is_null() {
         return SQL_INVALID_HANDLE;
     }
-    let _ = (attribute, value, buffer_length, string_length);
-    SQL_SUCCESS
+    let conn = unsafe { &*(hdbc as *mut Connection) };
+    let _ = (buffer_length, string_length);
+    match attribute {
+        SQL_ATTR_AUTOCOMMIT => {
+            if !value.is_null() {
+                unsafe {
+                    *(value as *mut SQLULEN) = if conn.autocommit { 1 } else { 0 };
+                }
+            }
+            SQL_SUCCESS
+        }
+        _ => SQL_SUCCESS,
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -1613,11 +1626,59 @@ pub extern "C" fn SQLGetDiagFieldW(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn SQLEndTran(
-    _handle_type: SQLSMALLINT,
-    _handle: SQLHANDLE,
-    _completion_type: SQLSMALLINT,
+    handle_type: SQLSMALLINT,
+    handle: SQLHANDLE,
+    completion_type: SQLSMALLINT,
 ) -> SQLRETURN {
-    SQL_SUCCESS
+    if handle.is_null() {
+        return SQL_INVALID_HANDLE;
+    }
+
+    let conn = match handle_type {
+        SQL_HANDLE_DBC => unsafe { &mut *(handle as *mut Connection) },
+        SQL_HANDLE_ENV => {
+            // For ENV handle, commit/rollback all connections — simplified: just succeed
+            return SQL_SUCCESS;
+        }
+        _ => return SQL_INVALID_HANDLE,
+    };
+
+    if !conn.in_transaction {
+        return SQL_SUCCESS;
+    }
+
+    let sql = if completion_type == SQL_COMMIT {
+        "COMMIT"
+    } else {
+        "ROLLBACK"
+    };
+
+    let client = match conn.client.as_mut() {
+        Some(c) => c,
+        None => return SQL_ERROR,
+    };
+
+    let result = crate::runtime::block_on(async {
+        let mut w = StringRowWriter::new();
+        client
+            .batch_into(sql, &mut w)
+            .await
+            .map_err(|e| e.to_string())
+    });
+
+    conn.in_transaction = false;
+
+    match result {
+        Ok(()) => SQL_SUCCESS,
+        Err(msg) => {
+            conn.diagnostics.push(DiagRecord {
+                state: "HY000".to_string(),
+                native_error: 0,
+                message: msg,
+            });
+            SQL_ERROR
+        }
+    }
 }
 
 // ── SQLCloseCursor ──────────────────────────────────────────────────

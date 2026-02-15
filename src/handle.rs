@@ -34,6 +34,8 @@ pub struct Connection {
     pub diagnostics: Vec<DiagRecord>,
     pub statements: Vec<*mut Statement>,
     pub connected: bool,
+    pub autocommit: bool,
+    pub in_transaction: bool,
 }
 
 /// Statement handle  

@@ -17,13 +17,37 @@ pub fn set_env_attr(
 }
 
 pub fn set_connect_attr(
-    _conn: &mut crate::handle::Connection,
+    conn: &mut crate::handle::Connection,
     attribute: SQLINTEGER,
-    _value: SQLPOINTER,
+    value: SQLPOINTER,
     _string_length: SQLINTEGER,
 ) -> SQLRETURN {
     match attribute {
-        SQL_ATTR_AUTOCOMMIT | SQL_ATTR_LOGIN_TIMEOUT | SQL_ATTR_CONNECTION_TIMEOUT => SQL_SUCCESS,
+        SQL_ATTR_AUTOCOMMIT => {
+            let val = value as SQLULEN;
+            let new_autocommit = val != 0; // SQL_AUTOCOMMIT_OFF = 0
+            if conn.autocommit != new_autocommit {
+                // If turning autocommit back on while in a transaction, commit
+                if new_autocommit && conn.in_transaction {
+                    if let Some(client) = conn.client.as_mut() {
+                        let result = crate::runtime::block_on(async {
+                            let mut w = crate::handle::StringRowWriter::new();
+                            client
+                                .batch_into("COMMIT", &mut w)
+                                .await
+                                .map_err(|e| e.to_string())
+                        });
+                        if let Err(_) = result {
+                            return SQL_ERROR;
+                        }
+                        conn.in_transaction = false;
+                    }
+                }
+                conn.autocommit = new_autocommit;
+            }
+            SQL_SUCCESS
+        }
+        SQL_ATTR_LOGIN_TIMEOUT | SQL_ATTR_CONNECTION_TIMEOUT => SQL_SUCCESS,
         _ => SQL_SUCCESS,
     }
 }
