@@ -206,3 +206,52 @@ pub const SQL_COLUMN_LABEL: SQLUSMALLINT = 18;
 // Transaction completion types
 pub const SQL_COMMIT: SQLSMALLINT = 0;
 pub const SQL_ROLLBACK: SQLSMALLINT = 1;
+
+// Additional C types
+pub const SQL_C_BIT: SQLSMALLINT = -7;
+pub const SQL_C_BINARY: SQLSMALLINT = -2;
+pub const SQL_C_TYPE_TIMESTAMP: SQLSMALLINT = 93;
+pub const SQL_C_TYPE_DATE: SQLSMALLINT = 91;
+pub const SQL_C_TYPE_TIME: SQLSMALLINT = 92;
+pub const SQL_C_GUID: SQLSMALLINT = -11;
+pub const SQL_C_UTINYINT: SQLSMALLINT = -28;
+pub const SQL_C_STINYINT: SQLSMALLINT = -26;
+pub const SQL_C_USHORT: SQLSMALLINT = -18;
+pub const SQL_C_ULONG: SQLSMALLINT = -22;
+
+// SQL_TIMESTAMP_STRUCT
+#[repr(C)]
+#[derive(Default)]
+pub struct SqlTimestampStruct {
+    pub year: i16,
+    pub month: u16,
+    pub day: u16,
+    pub hour: u16,
+    pub minute: u16,
+    pub second: u16,
+    pub fraction: u32, // nanoseconds
+}
+
+#[repr(C)]
+#[derive(Default)]
+pub struct SqlDateStruct {
+    pub year: i16,
+    pub month: u16,
+    pub day: u16,
+}
+
+#[repr(C)]
+#[derive(Default)]
+pub struct SqlTimeStruct {
+    pub hour: u16,
+    pub minute: u16,
+    pub second: u16,
+}
+
+#[repr(C)]
+pub struct SqlGuid {
+    pub data1: u32,
+    pub data2: u16,
+    pub data3: u16,
+    pub data4: [u8; 8],
+}
