@@ -1,0 +1,47 @@
+use crate::handle::*;
+use crate::runtime;
+use crate::types::*;
+
+pub fn exec_direct(stmt: &mut Statement, sql: &str) -> SQLRETURN {
+    let conn = unsafe { &mut *stmt.conn };
+
+    let client = match conn.client.as_mut() {
+        Some(c) => c,
+        None => {
+            stmt.diagnostics.push(DiagRecord {
+                state: "08003".to_string(),
+                native_error: 0,
+                message: "Not connected".to_string(),
+            });
+            return SQL_ERROR;
+        }
+    };
+
+    let mut writer = StringRowWriter::new();
+    let sql = sql.to_string();
+
+    let result = runtime::block_on(async {
+        client
+            .batch_into(sql, &mut writer)
+            .await
+            .map_err(|e| e.to_string())
+    });
+
+    match result {
+        Ok(()) => {
+            stmt.columns = writer.columns;
+            stmt.rows = writer.rows;
+            stmt.row_index = -1;
+            stmt.executed = true;
+            SQL_SUCCESS
+        }
+        Err(msg) => {
+            stmt.diagnostics.push(DiagRecord {
+                state: "HY000".to_string(),
+                native_error: 0,
+                message: msg,
+            });
+            SQL_ERROR
+        }
+    }
+}

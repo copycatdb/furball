@@ -1,0 +1,14 @@
+[package]
+name = "furball"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+tabby = { git = "https://github.com/copycatdb/tabby.git", branch = "main", default-features = false, features = ["rustls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "io-util"] }
+parking_lot = "0.12"
+once_cell = "1"
+tokio-util = { version = "0.7", features = ["compat"] }
