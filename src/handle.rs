@@ -45,6 +45,20 @@ pub struct Statement {
     pub diagnostics: Vec<DiagRecord>,
     pub executed: bool,
     pub prepared_sql: Option<String>,
+    pub row_count: SQLLEN,
+    pub bound_params: Vec<BoundParam>,
+}
+
+/// A bound parameter
+pub struct BoundParam {
+    pub param_number: u16,
+    pub value_type: SQLSMALLINT,
+    pub parameter_type: SQLSMALLINT,
+    pub column_size: SQLULEN,
+    pub decimal_digits: SQLSMALLINT,
+    pub value_ptr: SQLPOINTER,
+    pub buffer_length: SQLLEN,
+    pub len_ind_ptr: *mut SQLLEN,
 }
 
 // RowWriter implementation that collects everything as strings

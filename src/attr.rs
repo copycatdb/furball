@@ -153,3 +153,113 @@ pub fn get_stmt_attr(
 ) -> SQLRETURN {
     SQL_SUCCESS
 }
+
+pub fn get_info_w(
+    conn: &crate::handle::Connection,
+    info_type: SQLUSMALLINT,
+    info_value: SQLPOINTER,
+    buffer_length: SQLSMALLINT,
+    string_length: *mut SQLSMALLINT,
+) -> SQLRETURN {
+    // Helper to write a UTF-16 string info value
+    let write_str_w = |s: &str| -> SQLRETURN {
+        let utf16: Vec<u16> = s.encode_utf16().collect();
+        let byte_len = (utf16.len() * 2) as SQLSMALLINT;
+        if !string_length.is_null() {
+            unsafe {
+                *string_length = byte_len;
+            }
+        }
+        if !info_value.is_null() && buffer_length > 0 {
+            let buf_cap = (buffer_length as usize) / 2;
+            let copy_count = std::cmp::min(utf16.len(), buf_cap.saturating_sub(1));
+            let dest = info_value as *mut u16;
+            unsafe {
+                ptr::copy_nonoverlapping(utf16.as_ptr(), dest, copy_count);
+                *dest.add(copy_count) = 0;
+            }
+        }
+        SQL_SUCCESS
+    };
+
+    let write_u16 = |v: u16| -> SQLRETURN {
+        if !info_value.is_null() {
+            unsafe {
+                *(info_value as *mut u16) = v;
+            }
+        }
+        if !string_length.is_null() {
+            unsafe {
+                *string_length = 2;
+            }
+        }
+        SQL_SUCCESS
+    };
+
+    let write_u32 = |v: u32| -> SQLRETURN {
+        if !info_value.is_null() {
+            unsafe {
+                *(info_value as *mut u32) = v;
+            }
+        }
+        if !string_length.is_null() {
+            unsafe {
+                *string_length = 4;
+            }
+        }
+        SQL_SUCCESS
+    };
+
+    match info_type {
+        SQL_DRIVER_NAME => write_str_w("libfurball.so"),
+        SQL_DRIVER_VER => write_str_w("01.00.0000"),
+        SQL_DBMS_NAME => write_str_w("Microsoft SQL Server"),
+        SQL_DBMS_VER => write_str_w("16.00.0000"),
+        SQL_SERVER_NAME => write_str_w(&conn.server),
+        SQL_DATABASE_NAME => write_str_w(&conn.database),
+        SQL_USER_NAME => write_str_w(&conn.uid),
+        SQL_DATA_SOURCE_NAME => write_str_w(""),
+        SQL_SEARCH_PATTERN_ESCAPE => write_str_w("\\"),
+        SQL_IDENTIFIER_QUOTE_CHAR => write_str_w("\""),
+        SQL_CATALOG_NAME_SEPARATOR => write_str_w("."),
+        SQL_CATALOG_TERM => write_str_w("catalog"),
+        SQL_SCHEMA_TERM => write_str_w("schema"),
+        SQL_TABLE_TERM => write_str_w("table"),
+        SQL_NEED_LONG_DATA_LEN => write_str_w("N"),
+        SQL_ACCESSIBLE_TABLES => write_str_w("Y"),
+        SQL_ACCESSIBLE_PROCEDURES => write_str_w("Y"),
+        SQL_MULT_RESULT_SETS => write_str_w("Y"),
+        SQL_MULTIPLE_ACTIVE_TXN => write_str_w("Y"),
+        SQL_DESCRIBE_PARAMETER => write_str_w("Y"),
+        SQL_PROCEDURES => write_str_w("Y"),
+        SQL_COLUMN_ALIAS => write_str_w("Y"),
+        SQL_EXPRESSIONS_IN_ORDERBY => write_str_w("Y"),
+        SQL_OUTER_JOINS => write_str_w("Y"),
+        SQL_ORDER_BY_COLUMNS_IN_SELECT => write_str_w("Y"),
+        SQL_SPECIAL_CHARACTERS => write_str_w("_@#$"),
+        SQL_MAX_DRIVER_CONNECTIONS => write_u16(0),
+        SQL_CURSOR_COMMIT_BEHAVIOR => write_u16(0),
+        SQL_CURSOR_ROLLBACK_BEHAVIOR => write_u16(0),
+        SQL_TXN_CAPABLE => write_u16(SQL_TC_ALL),
+        SQL_CONCAT_NULL_BEHAVIOR => write_u16(0),
+        SQL_CORRELATION_NAME => write_u16(2),
+        SQL_GROUP_BY => write_u16(2),
+        SQL_QUOTED_IDENTIFIER_CASE => write_u16(3),
+        SQL_NON_NULLABLE_COLUMNS => write_u16(1),
+        SQL_NULL_COLLATION => write_u16(0),
+        SQL_MAX_COLUMNS_IN_GROUP_BY => write_u16(0),
+        SQL_MAX_COLUMNS_IN_ORDER_BY => write_u16(0),
+        SQL_MAX_COLUMNS_IN_SELECT => write_u16(0),
+        SQL_MAX_CATALOG_NAME_LEN => write_u16(128),
+        SQL_MAX_SCHEMA_NAME_LEN => write_u16(128),
+        SQL_MAX_TABLE_NAME_LEN => write_u16(128),
+        SQL_MAX_COLUMN_NAME_LEN => write_u16(128),
+        SQL_MAX_IDENTIFIER_LEN => write_u16(128),
+        SQL_GETDATA_EXTENSIONS => write_u32(SQL_GD_ANY_COLUMN | SQL_GD_ANY_ORDER),
+        SQL_TXN_ISOLATION_OPTION => write_u32(0x0F),
+        SQL_DEFAULT_TXN_ISOLATION => write_u32(2),
+        SQL_SUBQUERIES => write_u32(0x1F),
+        SQL_UNION => write_u32(3),
+        _ => write_str_w(""),
+    }
+}

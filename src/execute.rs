@@ -33,6 +33,13 @@ pub fn exec_direct(stmt: &mut Statement, sql: &str) -> SQLRETURN {
             stmt.rows = writer.rows;
             stmt.row_index = -1;
             stmt.executed = true;
+            // row_count: for SELECT it's -1 (unknown), for DML it's the number of rows
+            // If there are columns, it's a SELECT; otherwise it's DML
+            stmt.row_count = if stmt.columns.is_empty() {
+                stmt.rows.len() as SQLLEN
+            } else {
+                -1
+            };
             SQL_SUCCESS
         }
         Err(msg) => {
