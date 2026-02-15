@@ -1,9 +1,7 @@
 use crate::handle::*;
-use crate::runtime;
 use crate::types::*;
-use tabby::{AuthMethod, Config, EncryptionLevel};
-use tokio::net::TcpStream;
-use tokio_util::compat::TokioAsyncWriteCompatExt;
+use std::net::TcpStream;
+use tabby::{AuthMethod, Config, EncryptionLevel, SyncClient};
 
 pub fn parse_connection_string(conn_str: &str) -> (String, u16, String, String, String, bool) {
     let mut host = "localhost".to_string();
@@ -54,7 +52,7 @@ pub fn driver_connect(conn: &mut Connection, conn_str: &str) -> SQLRETURN {
     conn.uid = uid.clone();
     conn.pwd = pwd.clone();
 
-    let result = runtime::block_on(async {
+    let result = (|| {
         let mut config = Config::new();
         config.host(&host);
         config.port(port);
@@ -63,19 +61,15 @@ pub fn driver_connect(conn: &mut Connection, conn_str: &str) -> SQLRETURN {
         if trust_cert {
             config.trust_cert();
         }
-        config.encryption(EncryptionLevel::Required);
+        config.encryption(EncryptionLevel::NotSupported);
 
-        let tcp = TcpStream::connect(config.get_addr())
-            .await
-            .map_err(|e| e.to_string())?;
+        let tcp = TcpStream::connect(config.get_addr()).map_err(|e| e.to_string())?;
         tcp.set_nodelay(true).map_err(|e| e.to_string())?;
 
-        let client = tabby::Client::connect(config, tcp.compat_write())
-            .await
-            .map_err(|e| e.to_string())?;
+        let client = SyncClient::connect(config, tcp).map_err(|e| e.to_string())?;
 
         Ok::<_, String>(client)
-    });
+    })();
 
     match result {
         Ok(client) => {

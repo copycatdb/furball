@@ -30,13 +30,12 @@ pub fn set_connect_attr(
                 // If turning autocommit back on while in a transaction, commit
                 if new_autocommit && conn.in_transaction {
                     if let Some(client) = conn.client.as_mut() {
-                        let result = crate::runtime::block_on(async {
+                        let result = {
                             let mut w = crate::handle::StringRowWriter::new();
                             client
                                 .batch_into("COMMIT", &mut w)
-                                .await
                                 .map_err(|e| e.to_string())
-                        });
+                        };
                         if result.is_err() {
                             return SQL_ERROR;
                         }

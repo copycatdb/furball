@@ -14,7 +14,6 @@ mod diagnostics;
 mod execute;
 mod fetch;
 mod handle;
-mod runtime;
 mod types;
 
 use handle::*;
@@ -230,7 +229,7 @@ pub extern "C" fn SQLFreeStmt(hstmt: SQLHSTMT, option: SQLUSMALLINT) -> SQLRETUR
             if stmt.streaming {
                 let conn = unsafe { &mut *stmt.conn };
                 if let Some(client) = conn.client.as_mut() {
-                    let _ = runtime::block_on(async { client.batch_drain().await });
+                    let _ = client.batch_drain();
                 }
                 stmt.streaming = false;
             }
@@ -1639,26 +1638,24 @@ pub extern "C" fn SQLMoreResults(hstmt: SQLHSTMT) -> SQLRETURN {
             None => return SQL_NO_DATA,
         };
 
-        let result: Result<bool, tabby::error::Error> = runtime::block_on(async {
+        let result: Result<bool, tabby::error::Error> = {
             let mut dummy_writer = handle::SingleRowDrainWriter;
             let mut s = String::new();
             let mut b = Vec::new();
             loop {
-                match client
-                    .batch_fetch_row(&mut dummy_writer, &mut s, &mut b)
-                    .await?
-                {
-                    tabby::BatchFetchResult::Row => continue,
-                    tabby::BatchFetchResult::Done(_) => return Ok(false),
-                    tabby::BatchFetchResult::MoreResults => return Ok(true),
+                match client.batch_fetch_row(&mut dummy_writer, &mut s, &mut b) {
+                    Ok(tabby::BatchFetchResult::Row) => continue,
+                    Ok(tabby::BatchFetchResult::Done(_)) => break Ok(false),
+                    Ok(tabby::BatchFetchResult::MoreResults) => break Ok(true),
+                    Err(e) => break Err(e),
                 }
             }
-        });
+        };
 
         match result {
             Ok(true) => {
                 // Read next result set metadata
-                let meta_result = runtime::block_on(async { client.batch_fetch_metadata().await });
+                let meta_result = client.batch_fetch_metadata();
                 match meta_result {
                     Ok(columns) if !columns.is_empty() => {
                         stmt.columns = columns
@@ -1948,13 +1945,10 @@ pub extern "C" fn SQLEndTran(
         None => return SQL_ERROR,
     };
 
-    let result = crate::runtime::block_on(async {
+    let result = {
         let mut w = StringRowWriter::new();
-        client
-            .batch_into(sql, &mut w)
-            .await
-            .map_err(|e| e.to_string())
-    });
+        client.batch_into(sql, &mut w).map_err(|e| e.to_string())
+    };
 
     conn.in_transaction = false;
 

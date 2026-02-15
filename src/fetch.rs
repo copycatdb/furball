@@ -1,5 +1,4 @@
 use crate::handle::*;
-use crate::runtime;
 use crate::types::*;
 use std::ptr;
 use tabby::BatchFetchResult;
@@ -98,37 +97,38 @@ pub fn fetch(stmt: &mut Statement) -> SQLRETURN {
             let bytes_buf = &mut stmt.stream_bytes_buf;
             let prefetch_buffer = &mut stmt.prefetch_buffer;
 
-            let terminal = runtime::block_on(async {
+            let terminal = {
+                let mut result = None;
                 for _ in 0..256 {
                     row_buf.clear();
                     let mut writer = SingleRowWriter {
                         row: &mut row_buf,
                         info_messages: Vec::new(),
                     };
-                    match client
-                        .batch_fetch_row(&mut writer, string_buf, bytes_buf)
-                        .await
-                    {
+                    match client.batch_fetch_row(&mut writer, string_buf, bytes_buf) {
                         Ok(BatchFetchResult::Row) => {
                             info_msgs.extend(writer.info_messages);
                             prefetch_buffer.push_back(std::mem::replace(&mut row_buf, Vec::new()));
                         }
                         Ok(BatchFetchResult::Done(_)) => {
                             info_msgs.extend(writer.info_messages);
-                            return Some(PrefetchTerminal::Done);
+                            result = Some(PrefetchTerminal::Done);
+                            break;
                         }
                         Ok(BatchFetchResult::MoreResults) => {
                             info_msgs.extend(writer.info_messages);
-                            return Some(PrefetchTerminal::MoreResults);
+                            result = Some(PrefetchTerminal::MoreResults);
+                            break;
                         }
                         Err(e) => {
                             info_msgs.extend(writer.info_messages);
-                            return Some(PrefetchTerminal::Error(e.to_string()));
+                            result = Some(PrefetchTerminal::Error(e.to_string()));
+                            break;
                         }
                     }
                 }
-                None // filled 256 rows, no terminal yet
-            });
+                result
+            };
 
             // Transfer info messages
             for (number, message) in info_msgs {

@@ -182,7 +182,7 @@ pub struct Environment {
 /// Connection handle
 pub struct Connection {
     pub env: *mut Environment,
-    pub client: Option<tabby::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>>,
+    pub client: Option<tabby::SyncClient<std::net::TcpStream>>,
     pub server: String,
     pub database: String,
     pub uid: String,

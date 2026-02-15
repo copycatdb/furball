@@ -1,5 +1,4 @@
 use crate::handle::*;
-use crate::runtime;
 use crate::types::*;
 
 pub fn exec_direct(stmt: &mut Statement, sql: &str) -> SQLRETURN {
@@ -19,19 +18,18 @@ pub fn exec_direct(stmt: &mut Statement, sql: &str) -> SQLRETURN {
 
     // If we were previously streaming, drain the old stream first
     if stmt.streaming {
-        let _ = runtime::block_on(async { client.batch_drain().await });
+        let _ = client.batch_drain();
         stmt.streaming = false;
     }
 
     // If autocommit is OFF and we're not already in a transaction, start one
     if !conn.autocommit && !conn.in_transaction {
-        let begin_result = runtime::block_on(async {
+        let begin_result = {
             let mut w = StringRowWriter::new();
             client
                 .batch_into("BEGIN TRANSACTION", &mut w)
-                .await
                 .map_err(|e| e.to_string())
-        });
+        };
         if let Err(msg) = begin_result {
             stmt.diagnostics.push(DiagRecord {
                 state: "HY000".to_string(),
@@ -47,12 +45,9 @@ pub fn exec_direct(stmt: &mut Statement, sql: &str) -> SQLRETURN {
 
     // Use streaming API: send query, read only until metadata
     let mut rows_affected = 0u64;
-    let result = runtime::block_on(async {
-        client
-            .batch_start_with_rowcount(sql, &mut rows_affected)
-            .await
-            .map_err(|e| e.to_string())
-    });
+    let result = client
+        .batch_start_with_rowcount(&sql, &mut rows_affected)
+        .map_err(|e| e.to_string());
 
     match result {
         Ok(columns) => {
