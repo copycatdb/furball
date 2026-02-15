@@ -7,7 +7,7 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-tabby = { path = "/home/saurabh/.cargo/git/checkouts/tabby-7ab8d6730e5d9bfd/d087746", default-features = false, features = ["rustls"] }
+tabby = { git = "https://github.com/copycatdb/tabby.git", branch = "main", default-features = false, features = ["rustls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "io-util"] }
 parking_lot = "0.12"
 once_cell = "1"
