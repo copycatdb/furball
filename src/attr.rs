@@ -37,7 +37,7 @@ pub fn set_connect_attr(
                                 .await
                                 .map_err(|e| e.to_string())
                         });
-                        if let Err(_) = result {
+                        if result.is_err() {
                             return SQL_ERROR;
                         }
                         conn.in_transaction = false;

@@ -375,7 +375,7 @@ pub fn describe_col(
 fn parse_timestamp(s: &str) -> SqlTimestampStruct {
     let mut ts = SqlTimestampStruct::default();
     // "YYYY-MM-DD HH:MM:SS.fff"
-    let parts: Vec<&str> = s.splitn(2, |c| c == ' ' || c == 'T').collect();
+    let parts: Vec<&str> = s.splitn(2, [' ', 'T']).collect();
     if let Some(date_part) = parts.first() {
         let d: Vec<&str> = date_part.split('-').collect();
         if d.len() >= 3 {
@@ -386,10 +386,7 @@ fn parse_timestamp(s: &str) -> SqlTimestampStruct {
     }
     if let Some(time_part) = parts.get(1) {
         // Strip timezone offset if present
-        let time_str = time_part
-            .split(|c| c == '+' || c == '-')
-            .next()
-            .unwrap_or(time_part);
+        let time_str = time_part.split(['+', '-']).next().unwrap_or(time_part);
         let t: Vec<&str> = time_str.split(':').collect();
         if t.len() >= 3 {
             ts.hour = t[0].parse().unwrap_or(0);

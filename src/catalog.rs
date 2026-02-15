@@ -3,7 +3,7 @@ use crate::handle::*;
 use crate::types::*;
 
 pub fn get_type_info(stmt: &mut Statement, data_type: SQLSMALLINT) -> SQLRETURN {
-    let filter = if data_type == SQL_ALL_TYPES {
+    let _filter = if data_type == SQL_ALL_TYPES {
         String::new()
     } else {
         format!("WHERE DATA_TYPE = {}", data_type)

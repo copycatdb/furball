@@ -52,6 +52,7 @@ pub struct Statement {
 }
 
 /// A bound parameter
+#[allow(dead_code)]
 pub struct BoundParam {
     pub param_number: u16,
     pub value_type: SQLSMALLINT,

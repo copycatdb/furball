@@ -1,4 +1,11 @@
 #![allow(non_snake_case)]
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::upper_case_acronyms)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::manual_is_ascii_check)]
+#![allow(clippy::redundant_pattern_matching)]
+#![allow(clippy::useless_format)]
 
 mod attr;
 mod catalog;
@@ -52,6 +59,7 @@ unsafe fn sql_str(ptr: *const SQLCHAR, len: SQLSMALLINT) -> String {
     }
 }
 
+#[allow(dead_code)]
 unsafe fn sql_str_isize(ptr: *const SQLCHAR, len: SQLLEN) -> String {
     if ptr.is_null() {
         return String::new();
@@ -581,7 +589,6 @@ pub extern "C" fn SQLSetEnvAttr(
 }
 
 #[unsafe(no_mangle)]
-#[unsafe(no_mangle)]
 pub extern "C" fn SQLSetConnectAttr(
     hdbc: SQLHDBC,
     attribute: SQLINTEGER,
@@ -642,7 +649,7 @@ pub extern "C" fn SQLGetConnectAttr(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn SQLGetConnectAttrW(
-    hdbc: SQLHDBC,
+    _hdbc: SQLHDBC,
     attribute: SQLINTEGER,
     value: SQLPOINTER,
     buffer_length: SQLINTEGER,
@@ -800,14 +807,10 @@ pub extern "C" fn SQLColAttribute(
     };
 
     match field_identifier {
-        SQL_DESC_NAME | SQL_COLUMN_NAME | SQL_DESC_LABEL | SQL_COLUMN_LABEL => {
-            write_str_attr(&col.name)
-        }
-        SQL_DESC_CONCISE_TYPE | SQL_DESC_TYPE | SQL_COLUMN_TYPE => {
-            write_num(col.sql_type as SQLLEN)
-        }
+        SQL_DESC_NAME | SQL_COLUMN_NAME | SQL_DESC_LABEL => write_str_attr(&col.name),
+        SQL_DESC_CONCISE_TYPE | SQL_DESC_TYPE => write_num(col.sql_type as SQLLEN),
         SQL_DESC_LENGTH | SQL_COLUMN_LENGTH => write_num(col.size as SQLLEN),
-        SQL_DESC_DISPLAY_SIZE | SQL_COLUMN_DISPLAY_SIZE => {
+        SQL_DESC_DISPLAY_SIZE => {
             let display_size = match col.sql_type {
                 SQL_INTEGER => 11,
                 SQL_SMALLINT => 6,
@@ -930,14 +933,10 @@ pub extern "C" fn SQLColAttributeW(
     };
 
     match field_identifier {
-        SQL_DESC_NAME | SQL_COLUMN_NAME | SQL_DESC_LABEL | SQL_COLUMN_LABEL => {
-            write_str_w(&col.name)
-        }
-        SQL_DESC_CONCISE_TYPE | SQL_DESC_TYPE | SQL_COLUMN_TYPE => {
-            write_num(col.sql_type as SQLLEN)
-        }
+        SQL_DESC_NAME | SQL_COLUMN_NAME | SQL_DESC_LABEL => write_str_w(&col.name),
+        SQL_DESC_CONCISE_TYPE | SQL_DESC_TYPE => write_num(col.sql_type as SQLLEN),
         SQL_DESC_LENGTH | SQL_COLUMN_LENGTH => write_num(col.size as SQLLEN),
-        SQL_DESC_DISPLAY_SIZE | SQL_COLUMN_DISPLAY_SIZE => {
+        SQL_DESC_DISPLAY_SIZE => {
             let display_size = match col.sql_type {
                 SQL_INTEGER => 11,
                 SQL_SMALLINT => 6,
@@ -1372,7 +1371,7 @@ fn read_param_value(param: &BoundParam) -> String {
                 // SQL-escape single quotes
                 format!("N'{}'", s.replace('\'', "''"))
             }
-            SQL_C_CHAR | _ => {
+            _ => {
                 // ANSI string
                 let len_ind = if !param.len_ind_ptr.is_null() {
                     *param.len_ind_ptr
