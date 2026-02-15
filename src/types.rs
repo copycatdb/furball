@@ -219,6 +219,10 @@ pub const SQL_C_STINYINT: SQLSMALLINT = -26;
 pub const SQL_C_USHORT: SQLSMALLINT = -18;
 pub const SQL_C_ULONG: SQLSMALLINT = -22;
 
+// Data-at-execution constants
+pub const SQL_DATA_AT_EXEC: SQLLEN = -2;
+pub const SQL_LEN_DATA_AT_EXEC_OFFSET: SQLLEN = -100;
+
 // SQL_TIMESTAMP_STRUCT
 #[repr(C)]
 #[derive(Default)]

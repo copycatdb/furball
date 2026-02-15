@@ -49,6 +49,14 @@ pub struct Statement {
     pub prepared_sql: Option<String>,
     pub row_count: SQLLEN,
     pub bound_params: Vec<BoundParam>,
+    pub read_offsets: Vec<usize>, // tracks how much of each column has been read (for chunked SQLGetData)
+    pub paramset_size: usize,     // SQL_ATTR_PARAMSET_SIZE, default 1
+    // DAE (data-at-execution) state
+    pub dae_sql: Option<String>, // SQL to execute once all DAE params are collected
+    pub dae_params_needed: Vec<u16>, // param numbers that need DAE data (in order)
+    pub dae_current_idx: usize,  // which dae_params_needed entry we're on
+    pub dae_collected: Vec<(u16, String)>, // (param_number, collected_data)
+    pub dae_current_buf: Vec<u8>, // buffer for current param being collected via SQLPutData
 }
 
 /// A bound parameter
@@ -95,8 +103,10 @@ fn sql_type_from_column(c: &tabby::Column) -> (SQLSMALLINT, SQLULEN, SQLSMALLINT
         "Float8" | "Floatn" => SQL_DOUBLE,
         "Float4" => SQL_REAL,
         "Bit" | "Bitn" => SQL_BIT,
-        "BigVarChar" | "NVarchar" => SQL_WVARCHAR,
-        "BigChar" | "NChar" => SQL_WCHAR,
+        "BigVarChar" => SQL_VARCHAR,
+        "NVarchar" => SQL_WVARCHAR,
+        "BigChar" => SQL_CHAR,
+        "NChar" => SQL_WCHAR,
         "Text" => SQL_LONGVARCHAR,
         "NText" => SQL_WLONGVARCHAR,
         "BigBinary" => SQL_BINARY,
@@ -115,7 +125,8 @@ fn sql_type_from_column(c: &tabby::Column) -> (SQLSMALLINT, SQLULEN, SQLSMALLINT
         SQL_NO_NULLS
     };
 
-    // Determine size
+    // Extract size and decimal_digits from type_info when available
+    let mut decimal_digits: SQLSMALLINT = 0;
     let size: SQLULEN = match sql_type {
         SQL_INTEGER => 10,
         SQL_SMALLINT => 5,
@@ -128,11 +139,57 @@ fn sql_type_from_column(c: &tabby::Column) -> (SQLSMALLINT, SQLULEN, SQLSMALLINT
         SQL_TYPE_DATE => 10,
         SQL_TYPE_TIME => 16,
         SQL_GUID => 36,
-        SQL_DECIMAL => 38,
+        SQL_DECIMAL | SQL_NUMERIC => {
+            if let Some(tabby::DataType::VarLenSizedPrecision {
+                precision, scale, ..
+            }) = c.type_info()
+            {
+                decimal_digits = *scale as SQLSMALLINT;
+                *precision as SQLULEN
+            } else {
+                38
+            }
+        }
+        SQL_WVARCHAR | SQL_WCHAR | SQL_WLONGVARCHAR => {
+            if let Some(tabby::DataType::VarLenSized(desc)) = c.type_info() {
+                let len = desc.len();
+                if len >= 0xfffffffe {
+                    0
+                } else {
+                    len / 2
+                }
+            } else {
+                256
+            }
+        }
+        SQL_VARCHAR | SQL_CHAR | SQL_LONGVARCHAR => {
+            if let Some(tabby::DataType::VarLenSized(desc)) = c.type_info() {
+                let len = desc.len();
+                if len >= 0xfffffffe {
+                    0
+                } else {
+                    len
+                }
+            } else {
+                256
+            }
+        }
+        SQL_BINARY | SQL_VARBINARY | SQL_LONGVARBINARY => {
+            if let Some(tabby::DataType::VarLenSized(desc)) = c.type_info() {
+                let len = desc.len();
+                if len >= 0xfffffffe {
+                    0
+                } else {
+                    len
+                }
+            } else {
+                256
+            }
+        }
         _ => 256,
     };
 
-    (sql_type, size, 0, nullable)
+    (sql_type, size, decimal_digits, nullable)
 }
 
 impl RowWriter for StringRowWriter {
@@ -284,9 +341,9 @@ impl RowWriter for StringRowWriter {
     fn write_guid(&mut self, _col: usize, bytes: &[u8; 16]) {
         let fmt = format!(
             "{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-            u16::from_le_bytes([bytes[4], bytes[5]]),
-            u16::from_le_bytes([bytes[6], bytes[7]]),
+            u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            u16::from_be_bytes([bytes[4], bytes[5]]),
+            u16::from_be_bytes([bytes[6], bytes[7]]),
             bytes[8],
             bytes[9],
             bytes[10],

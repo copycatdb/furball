@@ -160,12 +160,30 @@ pub fn get_info(
 }
 
 pub fn set_stmt_attr(
-    _stmt: &mut crate::handle::Statement,
-    _attribute: SQLINTEGER,
-    _value: SQLPOINTER,
+    stmt: &mut crate::handle::Statement,
+    attribute: SQLINTEGER,
+    value: SQLPOINTER,
     _string_length: SQLINTEGER,
 ) -> SQLRETURN {
-    SQL_SUCCESS
+    const SQL_ATTR_PARAMSET_SIZE: SQLINTEGER = 22;
+    match attribute {
+        SQL_ATTR_PARAMSET_SIZE => {
+            let size = value as usize;
+            if size > 1 {
+                // Array parameter binding (fast_executemany) not supported
+                stmt.diagnostics.push(crate::handle::DiagRecord {
+                    state: "HYC00".to_string(),
+                    native_error: 0,
+                    message: "Array parameter binding (paramset_size > 1) not supported"
+                        .to_string(),
+                });
+                return SQL_ERROR;
+            }
+            stmt.paramset_size = 1;
+            SQL_SUCCESS
+        }
+        _ => SQL_SUCCESS,
+    }
 }
 
 pub fn get_stmt_attr(

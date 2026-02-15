@@ -141,6 +141,13 @@ fn alloc_handle_impl(
                 prepared_sql: None,
                 row_count: -1,
                 bound_params: Vec::new(),
+                read_offsets: Vec::new(),
+                paramset_size: 1,
+                dae_sql: None,
+                dae_params_needed: Vec::new(),
+                dae_current_idx: 0,
+                dae_collected: Vec::new(),
+                dae_current_buf: Vec::new(),
             });
             let stmt_ptr = Box::into_raw(stmt);
             if !input_handle.is_null() {
@@ -217,6 +224,7 @@ pub extern "C" fn SQLFreeStmt(hstmt: SQLHSTMT, option: SQLUSMALLINT) -> SQLRETUR
             stmt.row_index = -1;
             stmt.executed = false;
             stmt.row_count = -1;
+            stmt.read_offsets.clear();
             SQL_SUCCESS
         }
         SQL_UNBIND | SQL_RESET_PARAMS => {
@@ -293,7 +301,11 @@ pub extern "C" fn SQLExecDirect(
     stmt.diagnostics.clear();
 
     let sql = unsafe { sql_str(statement_text, text_length as SQLSMALLINT) };
-    execute::exec_direct(stmt, &sql)
+    let final_sql = handle_exec_params(stmt, sql);
+    match final_sql {
+        Ok(s) => execute::exec_direct(stmt, &s),
+        Err(ret) => ret,
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -327,7 +339,11 @@ pub extern "C" fn SQLExecDirectW(
         String::from_utf16_lossy(slice)
     };
 
-    execute::exec_direct(stmt, &sql)
+    let final_sql = handle_exec_params(stmt, sql);
+    match final_sql {
+        Ok(s) => execute::exec_direct(stmt, &s),
+        Err(ret) => ret,
+    }
 }
 
 // ── Results ─────────────────────────────────────────────────────────
@@ -396,7 +412,7 @@ pub extern "C" fn SQLGetData(
     if hstmt.is_null() {
         return SQL_INVALID_HANDLE;
     }
-    let stmt = unsafe { &*(hstmt as *const Statement) };
+    let stmt = unsafe { &mut *(hstmt as *mut Statement) };
     fetch::get_data(
         stmt,
         col,
@@ -419,64 +435,23 @@ pub extern "C" fn SQLGetDataW(
     if hstmt.is_null() {
         return SQL_INVALID_HANDLE;
     }
-    let stmt = unsafe { &*(hstmt as *const Statement) };
+    let stmt = unsafe { &mut *(hstmt as *mut Statement) };
 
-    // For non-character target types, delegate to ANSI version
-    if target_type != SQL_C_WCHAR && target_type != SQL_C_DEFAULT && target_type != SQL_C_CHAR {
-        return fetch::get_data(
-            stmt,
-            col,
-            target_type,
-            target_value,
-            buffer_length,
-            str_len_or_ind,
-        );
-    }
+    // For W variant, default to SQL_C_WCHAR for character data
+    let eff_type = if target_type == SQL_C_DEFAULT || target_type == SQL_C_CHAR {
+        SQL_C_WCHAR
+    } else {
+        target_type
+    };
 
-    // Character data: return UTF-16
-    if stmt.row_index < 0 || stmt.row_index as usize >= stmt.rows.len() {
-        return SQL_ERROR;
-    }
-    let row = &stmt.rows[stmt.row_index as usize];
-    let col_idx = (col as usize).wrapping_sub(1);
-    if col_idx >= row.len() {
-        return SQL_ERROR;
-    }
-
-    match &row[col_idx] {
-        None => {
-            if !str_len_or_ind.is_null() {
-                unsafe {
-                    *str_len_or_ind = SQL_NULL_DATA;
-                }
-            }
-            SQL_SUCCESS
-        }
-        Some(val) => {
-            let utf16: Vec<u16> = val.encode_utf16().collect();
-            let data_len_bytes = (utf16.len() * 2) as SQLLEN;
-
-            if !str_len_or_ind.is_null() {
-                unsafe {
-                    *str_len_or_ind = data_len_bytes;
-                }
-            }
-
-            if !target_value.is_null() && buffer_length > 0 {
-                let buf_u16_cap = (buffer_length as usize) / 2;
-                let copy_count = std::cmp::min(utf16.len(), buf_u16_cap.saturating_sub(1));
-                let dest = target_value as *mut u16;
-                unsafe {
-                    ptr::copy_nonoverlapping(utf16.as_ptr(), dest, copy_count);
-                    *dest.add(copy_count) = 0; // null terminate
-                }
-                if utf16.len() >= buf_u16_cap {
-                    return SQL_SUCCESS_WITH_INFO;
-                }
-            }
-            SQL_SUCCESS
-        }
-    }
+    fetch::get_data(
+        stmt,
+        col,
+        eff_type,
+        target_value,
+        buffer_length,
+        str_len_or_ind,
+    )
 }
 
 // ── Diagnostics ─────────────────────────────────────────────────────
@@ -1282,10 +1257,52 @@ pub extern "C" fn SQLExecute(hstmt: SQLHSTMT) -> SQLRETURN {
         }
     };
 
-    // Substitute bound parameters
+    // Check for data-at-execution params — we don't support DAE
+    // Also check for array parameter binding (paramset_size > 1)
     let final_sql = if stmt.bound_params.is_empty() {
         sql
     } else {
+        if stmt.paramset_size > 1 {
+            // Array binding (fast_executemany) — not supported, execute one row at a time
+            let mut last_ret = SQL_SUCCESS;
+            for row_idx in 0..stmt.paramset_size {
+                let row_sql = substitute_params_row(&sql, &stmt.bound_params, row_idx);
+                last_ret = execute::exec_direct(stmt, &row_sql);
+                if last_ret == SQL_ERROR {
+                    break;
+                }
+            }
+            stmt.bound_params.clear();
+            stmt.paramset_size = 1;
+            return last_ret;
+        }
+        // Check if any param uses DAE
+        let has_dae = stmt.bound_params.iter().any(|p| {
+            if p.len_ind_ptr.is_null() {
+                false
+            } else {
+                let ind = unsafe { *p.len_ind_ptr };
+                ind == SQL_DATA_AT_EXEC || ind <= SQL_LEN_DATA_AT_EXEC_OFFSET
+            }
+        });
+        if has_dae {
+            // Start DAE protocol: store SQL, identify which params need data
+            let mut dae_params: Vec<u16> = Vec::new();
+            for p in &stmt.bound_params {
+                if !p.len_ind_ptr.is_null() {
+                    let ind = unsafe { *p.len_ind_ptr };
+                    if ind == SQL_DATA_AT_EXEC || ind <= SQL_LEN_DATA_AT_EXEC_OFFSET {
+                        dae_params.push(p.param_number);
+                    }
+                }
+            }
+            stmt.dae_sql = Some(sql.clone());
+            stmt.dae_params_needed = dae_params;
+            stmt.dae_current_idx = 0;
+            stmt.dae_collected.clear();
+            stmt.dae_current_buf.clear();
+            return SQL_NEED_DATA;
+        }
         substitute_params(&sql, &stmt.bound_params)
     };
 
@@ -1295,7 +1312,47 @@ pub extern "C" fn SQLExecute(hstmt: SQLHSTMT) -> SQLRETURN {
     ret
 }
 
+fn handle_exec_params(stmt: &mut Statement, sql: String) -> Result<String, SQLRETURN> {
+    if stmt.bound_params.is_empty() {
+        return Ok(sql);
+    }
+    // Check for DAE params
+    let has_dae = stmt.bound_params.iter().any(|p| {
+        if p.len_ind_ptr.is_null() {
+            false
+        } else {
+            let ind = unsafe { *p.len_ind_ptr };
+            ind == SQL_DATA_AT_EXEC || ind <= SQL_LEN_DATA_AT_EXEC_OFFSET
+        }
+    });
+    if has_dae {
+        // Start DAE protocol
+        let mut dae_params: Vec<u16> = Vec::new();
+        for p in &stmt.bound_params {
+            if !p.len_ind_ptr.is_null() {
+                let ind = unsafe { *p.len_ind_ptr };
+                if ind == SQL_DATA_AT_EXEC || ind <= SQL_LEN_DATA_AT_EXEC_OFFSET {
+                    dae_params.push(p.param_number);
+                }
+            }
+        }
+        stmt.dae_sql = Some(sql);
+        stmt.dae_params_needed = dae_params;
+        stmt.dae_current_idx = 0;
+        stmt.dae_collected.clear();
+        stmt.dae_current_buf.clear();
+        return Err(SQL_NEED_DATA);
+    }
+    let s = substitute_params(&sql, &stmt.bound_params);
+    stmt.bound_params.clear();
+    Ok(s)
+}
+
 fn substitute_params(sql: &str, params: &[BoundParam]) -> String {
+    substitute_params_row(sql, params, 0)
+}
+
+fn substitute_params_row(sql: &str, params: &[BoundParam], _row_idx: usize) -> String {
     let mut result = String::with_capacity(sql.len() + 64);
     let mut param_idx = 0u16;
     for ch in sql.chars() {
@@ -1321,19 +1378,49 @@ fn read_param_value(param: &BoundParam) -> String {
         if len_ind == SQL_NULL_DATA {
             return "NULL".to_string();
         }
+        // Check for data-at-execution
+        if len_ind == SQL_DATA_AT_EXEC || len_ind <= SQL_LEN_DATA_AT_EXEC_OFFSET {
+            return "NULL".to_string();
+        }
     }
 
     if param.value_ptr.is_null() {
         return "NULL".to_string();
     }
 
+    // Resolve effective C type: SQL_C_DEFAULT means infer from parameter_type
+    let c_type = if param.value_type == SQL_C_DEFAULT {
+        match param.parameter_type {
+            SQL_INTEGER => SQL_C_LONG,
+            SQL_SMALLINT => SQL_C_SHORT,
+            SQL_BIGINT => SQL_C_SBIGINT,
+            SQL_TINYINT => SQL_C_UTINYINT,
+            SQL_DOUBLE | SQL_FLOAT => SQL_C_DOUBLE,
+            SQL_REAL => SQL_C_FLOAT,
+            SQL_BIT => SQL_C_BIT,
+            SQL_TYPE_TIMESTAMP => SQL_C_TYPE_TIMESTAMP,
+            SQL_TYPE_DATE => SQL_C_TYPE_DATE,
+            SQL_TYPE_TIME => SQL_C_TYPE_TIME,
+            SQL_BINARY | SQL_VARBINARY | SQL_LONGVARBINARY => SQL_C_BINARY,
+            SQL_GUID => SQL_C_GUID,
+            SQL_WVARCHAR | SQL_WCHAR | SQL_WLONGVARCHAR => SQL_C_WCHAR,
+            _ => SQL_C_CHAR,
+        }
+    } else {
+        param.value_type
+    };
+
     unsafe {
-        match param.value_type {
+        match c_type {
             SQL_C_LONG | SQL_C_SLONG => {
                 let v = *(param.value_ptr as *const i32);
                 v.to_string()
             }
-            SQL_C_SHORT => {
+            SQL_C_ULONG => {
+                let v = *(param.value_ptr as *const u32);
+                v.to_string()
+            }
+            SQL_C_SHORT | SQL_C_USHORT => {
                 let v = *(param.value_ptr as *const i16);
                 v.to_string()
             }
@@ -1343,11 +1430,93 @@ fn read_param_value(param: &BoundParam) -> String {
             }
             SQL_C_DOUBLE => {
                 let v = *(param.value_ptr as *const f64);
-                v.to_string()
+                format_float_f64(v)
             }
             SQL_C_FLOAT => {
                 let v = *(param.value_ptr as *const f32);
+                format_float_f64(v as f64)
+            }
+            SQL_C_BIT => {
+                let v = *(param.value_ptr as *const u8);
+                if v != 0 {
+                    "1".to_string()
+                } else {
+                    "0".to_string()
+                }
+            }
+            SQL_C_UTINYINT | SQL_C_STINYINT => {
+                let v = *(param.value_ptr as *const u8);
                 v.to_string()
+            }
+            SQL_C_TYPE_TIMESTAMP => {
+                let ts = &*(param.value_ptr as *const SqlTimestampStruct);
+                if ts.fraction > 0 {
+                    // Convert nanoseconds to fractional seconds string
+                    let micros = ts.fraction / 1000;
+                    if micros.is_multiple_of(1000) {
+                        format!(
+                            "N'{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}'",
+                            ts.year,
+                            ts.month,
+                            ts.day,
+                            ts.hour,
+                            ts.minute,
+                            ts.second,
+                            micros / 1000
+                        )
+                    } else {
+                        format!(
+                            "N'{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}'",
+                            ts.year, ts.month, ts.day, ts.hour, ts.minute, ts.second, micros
+                        )
+                    }
+                } else {
+                    format!(
+                        "N'{:04}-{:02}-{:02} {:02}:{:02}:{:02}'",
+                        ts.year, ts.month, ts.day, ts.hour, ts.minute, ts.second
+                    )
+                }
+            }
+            SQL_C_TYPE_DATE => {
+                let d = &*(param.value_ptr as *const SqlDateStruct);
+                format!("N'{:04}-{:02}-{:02}'", d.year, d.month, d.day)
+            }
+            SQL_C_TYPE_TIME => {
+                let t = &*(param.value_ptr as *const SqlTimeStruct);
+                format!("N'{:02}:{:02}:{:02}'", t.hour, t.minute, t.second)
+            }
+            SQL_C_BINARY => {
+                let len_ind = if !param.len_ind_ptr.is_null() {
+                    *param.len_ind_ptr
+                } else {
+                    param.buffer_length
+                };
+                let count = if len_ind >= 0 {
+                    len_ind as usize
+                } else {
+                    param.buffer_length as usize
+                };
+                let ptr = param.value_ptr as *const u8;
+                let slice = std::slice::from_raw_parts(ptr, count);
+                let hex: String = slice.iter().map(|b| format!("{:02x}", b)).collect();
+                format!("0x{}", hex)
+            }
+            SQL_C_GUID => {
+                let g = &*(param.value_ptr as *const SqlGuid);
+                format!(
+                    "N'{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}'",
+                    g.data1,
+                    g.data2,
+                    g.data3,
+                    g.data4[0],
+                    g.data4[1],
+                    g.data4[2],
+                    g.data4[3],
+                    g.data4[4],
+                    g.data4[5],
+                    g.data4[6],
+                    g.data4[7]
+                )
             }
             SQL_C_WCHAR => {
                 // UTF-16 string
@@ -1372,7 +1541,7 @@ fn read_param_value(param: &BoundParam) -> String {
                 format!("N'{}'", s.replace('\'', "''"))
             }
             _ => {
-                // ANSI string
+                // SQL_C_CHAR or unknown: ANSI string
                 let len_ind = if !param.len_ind_ptr.is_null() {
                     *param.len_ind_ptr
                 } else {
@@ -1410,6 +1579,14 @@ fn read_param_value(param: &BoundParam) -> String {
                 }
             }
         }
+    }
+}
+
+fn format_float_f64(v: f64) -> String {
+    if v.fract() == 0.0 && v.abs() < 1e15 {
+        format!("{:.1}", v)
+    } else {
+        v.to_string()
     }
 }
 
@@ -1721,6 +1898,45 @@ pub extern "C" fn SQLNativeSql(
     SQL_SUCCESS
 }
 
+// ── SQLDescribeParam ────────────────────────────────────────────────
+
+#[unsafe(no_mangle)]
+pub extern "C" fn SQLDescribeParam(
+    hstmt: SQLHSTMT,
+    param_number: SQLUSMALLINT,
+    data_type: *mut SQLSMALLINT,
+    param_size: *mut SQLULEN,
+    decimal_digits: *mut SQLSMALLINT,
+    nullable: *mut SQLSMALLINT,
+) -> SQLRETURN {
+    if hstmt.is_null() {
+        return SQL_INVALID_HANDLE;
+    }
+    // Return generic nvarchar type for all parameters
+    if !data_type.is_null() {
+        unsafe {
+            *data_type = SQL_WVARCHAR;
+        }
+    }
+    if !param_size.is_null() {
+        unsafe {
+            *param_size = 4000;
+        }
+    }
+    if !decimal_digits.is_null() {
+        unsafe {
+            *decimal_digits = 0;
+        }
+    }
+    if !nullable.is_null() {
+        unsafe {
+            *nullable = SQL_NULLABLE;
+        }
+    }
+    let _ = param_number;
+    SQL_SUCCESS
+}
+
 // ── SQLNumParams ────────────────────────────────────────────────────
 
 #[unsafe(no_mangle)]
@@ -1779,6 +1995,8 @@ pub extern "C" fn SQLGetFunctions(
                 44,   // SQL_API_SQLGETFUNCTIONS
                 45,   // SQL_API_SQLGETINFO
                 47,   // SQL_API_SQLGETTYPEINFO
+                48,   // SQL_API_SQLPARAMDATA
+                49,   // SQL_API_SQLPUTDATA
                 54,   // SQL_API_SQLNATIVESQL
                 60,   // SQL_API_SQLBINDPARAMETER (ODBC2 location)
                 61,   // SQL_API_SQLMORERESULTS
@@ -2100,6 +2318,151 @@ pub extern "C" fn SQLCancel(hstmt: SQLHSTMT) -> SQLRETURN {
     if hstmt.is_null() {
         return SQL_INVALID_HANDLE;
     }
+    SQL_SUCCESS
+}
+
+// ── SQLParamData / SQLPutData (DAE implementation) ──────────────────
+
+#[unsafe(no_mangle)]
+pub extern "C" fn SQLParamData(hstmt: SQLHSTMT, value_ptr_ptr: *mut SQLPOINTER) -> SQLRETURN {
+    if hstmt.is_null() {
+        return SQL_INVALID_HANDLE;
+    }
+    let stmt = unsafe { &mut *(hstmt as *mut Statement) };
+
+    // If we have a current buffer from SQLPutData, finalize it
+    if !stmt.dae_current_buf.is_empty() && stmt.dae_current_idx > 0 {
+        let param_num = stmt.dae_params_needed[stmt.dae_current_idx - 1];
+        // Check if the param was bound as WCHAR (UTF-16) — decode accordingly
+        let is_wchar = stmt
+            .bound_params
+            .iter()
+            .find(|p| p.param_number == param_num)
+            .map(|p| {
+                p.value_type == SQL_C_WCHAR
+                    || (p.value_type == SQL_C_DEFAULT
+                        && matches!(
+                            p.parameter_type,
+                            SQL_WVARCHAR | SQL_WCHAR | SQL_WLONGVARCHAR
+                        ))
+            })
+            .unwrap_or(false);
+        let data = if is_wchar && stmt.dae_current_buf.len() >= 2 {
+            // Interpret as UTF-16LE
+            let u16_slice: Vec<u16> = stmt
+                .dae_current_buf
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            String::from_utf16_lossy(&u16_slice)
+        } else {
+            String::from_utf8_lossy(&stmt.dae_current_buf).to_string()
+        };
+        stmt.dae_collected.push((param_num, data));
+        stmt.dae_current_buf.clear();
+    }
+
+    // Check if there are more params needing data
+    if stmt.dae_current_idx < stmt.dae_params_needed.len() {
+        let param_num = stmt.dae_params_needed[stmt.dae_current_idx];
+        stmt.dae_current_idx += 1;
+
+        // Return the value_ptr that was passed in SQLBindParameter for this param
+        // pyodbc uses this to identify which parameter
+        if !value_ptr_ptr.is_null() {
+            if let Some(bp) = stmt
+                .bound_params
+                .iter()
+                .find(|p| p.param_number == param_num)
+            {
+                unsafe {
+                    *value_ptr_ptr = bp.value_ptr;
+                }
+            }
+        }
+        return SQL_NEED_DATA;
+    }
+
+    // All params collected — build the SQL and execute
+    if let Some(sql) = stmt.dae_sql.take() {
+        // Build substitution: for DAE params use collected data, for non-DAE use read_param_value
+        let mut result = String::with_capacity(sql.len() + 256);
+        let mut param_idx = 0u16;
+        for ch in sql.chars() {
+            if ch == '?' {
+                param_idx += 1;
+                // Check if this param was DAE-collected
+                if let Some((_num, data)) = stmt.dae_collected.iter().find(|(n, _)| *n == param_idx)
+                {
+                    // Escape and quote the string
+                    let escaped = data.replace('\'', "''");
+                    result.push_str(&format!("N'{}'", escaped));
+                } else if let Some(param) = stmt
+                    .bound_params
+                    .iter()
+                    .find(|p| p.param_number == param_idx)
+                {
+                    let val = read_param_value(param);
+                    result.push_str(&val);
+                } else {
+                    result.push_str("NULL");
+                }
+            } else {
+                result.push(ch);
+            }
+        }
+
+        // Clear DAE state
+        stmt.dae_params_needed.clear();
+        stmt.dae_current_idx = 0;
+        stmt.dae_collected.clear();
+        stmt.dae_current_buf.clear();
+        stmt.bound_params.clear();
+
+        return execute::exec_direct(stmt, &result);
+    }
+
+    SQL_ERROR
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn SQLPutData(
+    hstmt: SQLHSTMT,
+    data_ptr: SQLPOINTER,
+    str_len_or_ind: SQLLEN,
+) -> SQLRETURN {
+    if hstmt.is_null() {
+        return SQL_INVALID_HANDLE;
+    }
+    let stmt = unsafe { &mut *(hstmt as *mut Statement) };
+
+    if data_ptr.is_null() || str_len_or_ind == SQL_NULL_DATA {
+        // NULL data for this param
+        return SQL_SUCCESS;
+    }
+
+    let len = if str_len_or_ind == SQL_NTS as SQLLEN {
+        // Null-terminated string — find length
+        let ptr = data_ptr as *const u8;
+        let mut l = 0usize;
+        unsafe {
+            while *ptr.add(l) != 0 {
+                l += 1;
+            }
+        }
+        l
+    } else if str_len_or_ind >= 0 {
+        str_len_or_ind as usize
+    } else {
+        0
+    };
+
+    if len > 0 {
+        let ptr = data_ptr as *const u8;
+        let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+        stmt.dae_current_buf.extend_from_slice(slice);
+    }
+
     SQL_SUCCESS
 }
 

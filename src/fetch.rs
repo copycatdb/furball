@@ -7,6 +7,8 @@ pub fn fetch(stmt: &mut Statement) -> SQLRETURN {
         return SQL_ERROR;
     }
     stmt.row_index += 1;
+    // Reset read offsets on each new row
+    stmt.read_offsets.clear();
     if stmt.row_index as usize >= stmt.rows.len() {
         SQL_NO_DATA
     } else {
@@ -15,7 +17,7 @@ pub fn fetch(stmt: &mut Statement) -> SQLRETURN {
 }
 
 pub fn get_data(
-    stmt: &Statement,
+    stmt: &mut Statement,
     col: SQLUSMALLINT,
     target_type: SQLSMALLINT,
     target_value: SQLPOINTER,
@@ -31,6 +33,11 @@ pub fn get_data(
         return SQL_ERROR;
     }
 
+    // Ensure read_offsets is large enough
+    while stmt.read_offsets.len() <= col_idx {
+        stmt.read_offsets.push(0);
+    }
+
     match &row[col_idx] {
         None => {
             if !str_len_or_ind.is_null() {
@@ -38,6 +45,7 @@ pub fn get_data(
                     *str_len_or_ind = SQL_NULL_DATA;
                 }
             }
+            stmt.read_offsets[col_idx] = 0;
             SQL_SUCCESS
         }
         Some(val) => {
@@ -67,6 +75,9 @@ pub fn get_data(
                 target_type
             };
 
+            // Clone val to avoid borrow issues with stmt
+            let val = val.clone();
+
             match eff_type {
                 SQL_C_LONG | SQL_C_SLONG => {
                     let v: i32 = val.parse().unwrap_or(0);
@@ -80,6 +91,7 @@ pub fn get_data(
                             *str_len_or_ind = 4;
                         }
                     }
+                    stmt.read_offsets[col_idx] = 0;
                     SQL_SUCCESS
                 }
                 SQL_C_SHORT => {
@@ -94,6 +106,7 @@ pub fn get_data(
                             *str_len_or_ind = 2;
                         }
                     }
+                    stmt.read_offsets[col_idx] = 0;
                     SQL_SUCCESS
                 }
                 SQL_C_SBIGINT => {
@@ -108,6 +121,7 @@ pub fn get_data(
                             *str_len_or_ind = 8;
                         }
                     }
+                    stmt.read_offsets[col_idx] = 0;
                     SQL_SUCCESS
                 }
                 SQL_C_DOUBLE => {
@@ -122,6 +136,7 @@ pub fn get_data(
                             *str_len_or_ind = 8;
                         }
                     }
+                    stmt.read_offsets[col_idx] = 0;
                     SQL_SUCCESS
                 }
                 SQL_C_FLOAT => {
@@ -136,29 +151,61 @@ pub fn get_data(
                             *str_len_or_ind = 4;
                         }
                     }
+                    stmt.read_offsets[col_idx] = 0;
                     SQL_SUCCESS
                 }
                 SQL_C_WCHAR => {
-                    // UTF-16
+                    // UTF-16 with chunked read support
                     let utf16: Vec<u16> = val.encode_utf16().collect();
-                    let data_len_bytes = (utf16.len() * 2) as SQLLEN;
-                    if !str_len_or_ind.is_null() {
-                        unsafe {
-                            *str_len_or_ind = data_len_bytes;
+                    let total_bytes = (utf16.len() * 2) as SQLLEN;
+                    let offset = stmt.read_offsets[col_idx]; // offset in u16 units
+                    let remaining_u16 = if offset < utf16.len() {
+                        &utf16[offset..]
+                    } else {
+                        // All data already returned
+                        if !str_len_or_ind.is_null() {
+                            unsafe {
+                                *str_len_or_ind = 0;
+                            }
+                        }
+                        stmt.read_offsets[col_idx] = 0;
+                        return SQL_NO_DATA;
+                    };
+
+                    let remaining_bytes = (remaining_u16.len() * 2) as SQLLEN;
+
+                    if offset == 0 {
+                        // First call: report full length
+                        if !str_len_or_ind.is_null() {
+                            unsafe {
+                                *str_len_or_ind = total_bytes;
+                            }
+                        }
+                    } else {
+                        // Subsequent call: report remaining
+                        if !str_len_or_ind.is_null() {
+                            unsafe {
+                                *str_len_or_ind = remaining_bytes;
+                            }
                         }
                     }
+
                     if !target_value.is_null() && buffer_length > 0 {
                         let buf_u16_cap = (buffer_length as usize) / 2;
-                        let copy_count = std::cmp::min(utf16.len(), buf_u16_cap.saturating_sub(1));
+                        let copy_count =
+                            std::cmp::min(remaining_u16.len(), buf_u16_cap.saturating_sub(1));
                         let dest = target_value as *mut u16;
                         unsafe {
-                            ptr::copy_nonoverlapping(utf16.as_ptr(), dest, copy_count);
+                            ptr::copy_nonoverlapping(remaining_u16.as_ptr(), dest, copy_count);
                             *dest.add(copy_count) = 0;
                         }
-                        if utf16.len() >= buf_u16_cap {
+                        stmt.read_offsets[col_idx] = offset + copy_count;
+                        if remaining_u16.len() > copy_count {
                             return SQL_SUCCESS_WITH_INFO;
                         }
                     }
+                    // Done, reset offset
+                    stmt.read_offsets[col_idx] = 0;
                     SQL_SUCCESS
                 }
                 SQL_C_BIT => {
@@ -173,6 +220,7 @@ pub fn get_data(
                             *str_len_or_ind = 1;
                         }
                     }
+                    stmt.read_offsets[col_idx] = 0;
                     SQL_SUCCESS
                 }
                 SQL_C_UTINYINT | SQL_C_STINYINT => {
@@ -187,11 +235,11 @@ pub fn get_data(
                             *str_len_or_ind = 1;
                         }
                     }
+                    stmt.read_offsets[col_idx] = 0;
                     SQL_SUCCESS
                 }
                 SQL_C_TYPE_TIMESTAMP => {
-                    // Parse "YYYY-MM-DD HH:MM:SS.fff" format
-                    let ts = parse_timestamp(val);
+                    let ts = parse_timestamp(&val);
                     if !target_value.is_null() {
                         unsafe {
                             *(target_value as *mut SqlTimestampStruct) = ts;
@@ -202,10 +250,11 @@ pub fn get_data(
                             *str_len_or_ind = std::mem::size_of::<SqlTimestampStruct>() as SQLLEN;
                         }
                     }
+                    stmt.read_offsets[col_idx] = 0;
                     SQL_SUCCESS
                 }
                 SQL_C_TYPE_DATE => {
-                    let ts = parse_timestamp(val);
+                    let ts = parse_timestamp(&val);
                     if !target_value.is_null() {
                         unsafe {
                             let d = target_value as *mut SqlDateStruct;
@@ -219,10 +268,11 @@ pub fn get_data(
                             *str_len_or_ind = std::mem::size_of::<SqlDateStruct>() as SQLLEN;
                         }
                     }
+                    stmt.read_offsets[col_idx] = 0;
                     SQL_SUCCESS
                 }
                 SQL_C_TYPE_TIME => {
-                    let ts = parse_timestamp(val);
+                    let ts = parse_timestamp(&val);
                     if !target_value.is_null() {
                         unsafe {
                             let t = target_value as *mut SqlTimeStruct;
@@ -236,40 +286,62 @@ pub fn get_data(
                             *str_len_or_ind = std::mem::size_of::<SqlTimeStruct>() as SQLLEN;
                         }
                     }
+                    stmt.read_offsets[col_idx] = 0;
                     SQL_SUCCESS
                 }
                 SQL_C_BINARY => {
                     // val is hex-encoded for binary, raw bytes for strings
                     let bytes = if val.chars().all(|c| c.is_ascii_hexdigit()) && val.len() % 2 == 0
                     {
-                        hex_decode(val)
+                        hex_decode(&val)
                     } else {
                         val.as_bytes().to_vec()
                     };
-                    let data_len = bytes.len() as SQLLEN;
-                    if !str_len_or_ind.is_null() {
+                    let offset = stmt.read_offsets[col_idx];
+                    let remaining = if offset < bytes.len() {
+                        &bytes[offset..]
+                    } else {
+                        if !str_len_or_ind.is_null() {
+                            unsafe {
+                                *str_len_or_ind = 0;
+                            }
+                        }
+                        stmt.read_offsets[col_idx] = 0;
+                        return SQL_NO_DATA;
+                    };
+
+                    let remaining_len = remaining.len() as SQLLEN;
+                    if offset == 0 {
+                        if !str_len_or_ind.is_null() {
+                            unsafe {
+                                *str_len_or_ind = bytes.len() as SQLLEN;
+                            }
+                        }
+                    } else if !str_len_or_ind.is_null() {
                         unsafe {
-                            *str_len_or_ind = data_len;
+                            *str_len_or_ind = remaining_len;
                         }
                     }
+
                     if !target_value.is_null() && buffer_length > 0 {
-                        let copy_len = std::cmp::min(data_len, buffer_length) as usize;
+                        let copy_len = std::cmp::min(remaining_len, buffer_length) as usize;
                         unsafe {
                             ptr::copy_nonoverlapping(
-                                bytes.as_ptr(),
+                                remaining.as_ptr(),
                                 target_value as *mut u8,
                                 copy_len,
                             );
                         }
-                        if data_len > buffer_length {
+                        stmt.read_offsets[col_idx] = offset + copy_len;
+                        if remaining.len() > copy_len {
                             return SQL_SUCCESS_WITH_INFO;
                         }
                     }
+                    stmt.read_offsets[col_idx] = 0;
                     SQL_SUCCESS
                 }
                 SQL_C_GUID => {
-                    // Parse GUID string "XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"
-                    let guid = parse_guid(val);
+                    let guid = parse_guid(&val);
                     if !target_value.is_null() {
                         unsafe {
                             *(target_value as *mut SqlGuid) = guid;
@@ -280,33 +352,64 @@ pub fn get_data(
                             *str_len_or_ind = 16;
                         }
                     }
+                    stmt.read_offsets[col_idx] = 0;
                     SQL_SUCCESS
                 }
                 _ => {
-                    // SQL_C_CHAR or unknown: return as ANSI string
+                    // SQL_C_CHAR or unknown: return as ANSI string with chunked read support
                     let bytes = val.as_bytes();
-                    let data_len = bytes.len() as SQLLEN;
+                    let offset = stmt.read_offsets[col_idx];
 
-                    if !str_len_or_ind.is_null() {
-                        unsafe {
-                            *str_len_or_ind = data_len;
+                    let remaining = if offset < bytes.len() {
+                        &bytes[offset..]
+                    } else if offset > 0 {
+                        // All data already returned
+                        if !str_len_or_ind.is_null() {
+                            unsafe {
+                                *str_len_or_ind = 0;
+                            }
+                        }
+                        stmt.read_offsets[col_idx] = 0;
+                        return SQL_NO_DATA;
+                    } else {
+                        bytes
+                    };
+
+                    let remaining_len = remaining.len() as SQLLEN;
+
+                    if offset == 0 {
+                        // First call: report full data length
+                        if !str_len_or_ind.is_null() {
+                            unsafe {
+                                *str_len_or_ind = bytes.len() as SQLLEN;
+                            }
+                        }
+                    } else {
+                        // Subsequent call: report remaining length
+                        if !str_len_or_ind.is_null() {
+                            unsafe {
+                                *str_len_or_ind = remaining_len;
+                            }
                         }
                     }
 
                     if !target_value.is_null() && buffer_length > 0 {
-                        let copy_len = std::cmp::min(data_len, buffer_length - 1) as usize;
+                        let copy_len = std::cmp::min(remaining_len, buffer_length - 1) as usize;
                         unsafe {
                             ptr::copy_nonoverlapping(
-                                bytes.as_ptr(),
+                                remaining.as_ptr(),
                                 target_value as *mut u8,
                                 copy_len,
                             );
                             *((target_value as *mut u8).add(copy_len)) = 0;
                         }
-                        if data_len >= buffer_length {
+                        stmt.read_offsets[col_idx] = offset + copy_len;
+                        if remaining.len() > copy_len {
                             return SQL_SUCCESS_WITH_INFO;
                         }
                     }
+                    // Done reading this column
+                    stmt.read_offsets[col_idx] = 0;
                     SQL_SUCCESS
                 }
             }
