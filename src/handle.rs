@@ -210,6 +210,11 @@ pub struct Statement {
     pub dae_current_buf: Vec<u8>, // buffer for current param being collected via SQLPutData
     // Multiple result sets
     pub pending_result_sets: Vec<ResultSet>, // remaining result sets after the current one
+    // Streaming state
+    pub streaming: bool, // true if we're in streaming mode (batch_start was called)
+    pub stream_string_buf: String, // reusable buffer for streaming decode
+    pub stream_bytes_buf: Vec<u8>, // reusable buffer for streaming decode
+    pub current_row: Vec<CellValue>, // single-row buffer for streaming fetch
 }
 
 /// A bound parameter
@@ -257,6 +262,7 @@ impl StringRowWriter {
     }
 
     /// Finalize: flush any pending result set and return all collected result sets
+    #[allow(dead_code)]
     pub fn finalize(&mut self) {
         if self.got_metadata {
             self.result_sets.push(ResultSet {
@@ -270,7 +276,7 @@ impl StringRowWriter {
     }
 }
 
-fn sql_type_from_column(c: &tabby::Column) -> (SQLSMALLINT, SQLULEN, SQLSMALLINT, SQLSMALLINT) {
+pub fn sql_type_from_column(c: &tabby::Column) -> (SQLSMALLINT, SQLULEN, SQLSMALLINT, SQLSMALLINT) {
     let type_name = format!("{:?}", c.column_type());
     let sql_type = match type_name.as_str() {
         "Int4" => SQL_INTEGER,
@@ -476,4 +482,26 @@ pub(crate) mod hex {
     pub fn encode(data: &[u8]) -> String {
         data.iter().map(|b| format!("{:02x}", b)).collect()
     }
+}
+
+/// A no-op RowWriter used to drain remaining rows without storing them.
+pub struct SingleRowDrainWriter;
+
+impl RowWriter for SingleRowDrainWriter {
+    fn write_null(&mut self, _col: usize) {}
+    fn write_bool(&mut self, _col: usize, _val: bool) {}
+    fn write_u8(&mut self, _col: usize, _val: u8) {}
+    fn write_i16(&mut self, _col: usize, _val: i16) {}
+    fn write_i32(&mut self, _col: usize, _val: i32) {}
+    fn write_i64(&mut self, _col: usize, _val: i64) {}
+    fn write_f32(&mut self, _col: usize, _val: f32) {}
+    fn write_f64(&mut self, _col: usize, _val: f64) {}
+    fn write_str(&mut self, _col: usize, _val: &str) {}
+    fn write_bytes(&mut self, _col: usize, _val: &[u8]) {}
+    fn write_date(&mut self, _col: usize, _days: i32) {}
+    fn write_time(&mut self, _col: usize, _nanos: i64) {}
+    fn write_datetime(&mut self, _col: usize, _micros: i64) {}
+    fn write_datetimeoffset(&mut self, _col: usize, _micros: i64, _offset_minutes: i16) {}
+    fn write_decimal(&mut self, _col: usize, _value: i128, _precision: u8, _scale: u8) {}
+    fn write_guid(&mut self, _col: usize, _bytes: &[u8; 16]) {}
 }

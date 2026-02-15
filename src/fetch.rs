@@ -1,18 +1,154 @@
 use crate::handle::*;
+use crate::runtime;
 use crate::types::*;
 use std::ptr;
+use tabby::BatchFetchResult;
+
+/// Single-row writer that appends values to a Vec<CellValue>
+struct SingleRowWriter<'a> {
+    row: &'a mut Vec<CellValue>,
+    info_messages: Vec<(u32, String)>,
+}
+
+impl<'a> tabby::RowWriter for SingleRowWriter<'a> {
+    fn write_null(&mut self, _col: usize) {
+        self.row.push(CellValue::Null);
+    }
+    fn write_bool(&mut self, _col: usize, val: bool) {
+        self.row.push(CellValue::Bool(val));
+    }
+    fn write_u8(&mut self, _col: usize, val: u8) {
+        self.row.push(CellValue::U8(val));
+    }
+    fn write_i16(&mut self, _col: usize, val: i16) {
+        self.row.push(CellValue::I16(val));
+    }
+    fn write_i32(&mut self, _col: usize, val: i32) {
+        self.row.push(CellValue::I32(val));
+    }
+    fn write_i64(&mut self, _col: usize, val: i64) {
+        self.row.push(CellValue::I64(val));
+    }
+    fn write_f32(&mut self, _col: usize, val: f32) {
+        self.row.push(CellValue::F32(val));
+    }
+    fn write_f64(&mut self, _col: usize, val: f64) {
+        self.row.push(CellValue::F64(val));
+    }
+    fn write_str(&mut self, _col: usize, val: &str) {
+        self.row.push(CellValue::String(val.to_string()));
+    }
+    fn write_bytes(&mut self, _col: usize, val: &[u8]) {
+        self.row.push(CellValue::Bytes(val.to_vec()));
+    }
+    fn write_date(&mut self, _col: usize, days: i32) {
+        self.row.push(CellValue::Date { days });
+    }
+    fn write_time(&mut self, _col: usize, nanos: i64) {
+        self.row.push(CellValue::Time { nanos });
+    }
+    fn write_datetime(&mut self, _col: usize, micros: i64) {
+        self.row.push(CellValue::DateTime { micros });
+    }
+    fn write_datetimeoffset(&mut self, _col: usize, micros: i64, offset_minutes: i16) {
+        self.row.push(CellValue::DateTimeOffset {
+            micros,
+            offset_min: offset_minutes,
+        });
+    }
+    fn write_decimal(&mut self, _col: usize, value: i128, precision: u8, scale: u8) {
+        self.row.push(CellValue::Decimal {
+            value,
+            precision,
+            scale,
+        });
+    }
+    fn write_guid(&mut self, _col: usize, bytes: &[u8; 16]) {
+        self.row.push(CellValue::Guid(*bytes));
+    }
+    fn on_info(&mut self, number: u32, message: &str) {
+        self.info_messages.push((number, message.to_string()));
+    }
+}
 
 pub fn fetch(stmt: &mut Statement) -> SQLRETURN {
     if !stmt.executed {
         return SQL_ERROR;
     }
-    stmt.row_index += 1;
+
     // Reset read offsets on each new row
     stmt.read_offsets.clear();
-    if stmt.row_index as usize >= stmt.rows.len() {
-        SQL_NO_DATA
+
+    if stmt.streaming {
+        // Streaming mode: fetch next row from the TDS stream
+        let conn = unsafe { &mut *stmt.conn };
+        let client = match conn.client.as_mut() {
+            Some(c) => c,
+            None => return SQL_ERROR,
+        };
+
+        stmt.current_row.clear();
+        let mut writer = SingleRowWriter {
+            row: &mut stmt.current_row,
+            info_messages: Vec::new(),
+        };
+
+        let result = runtime::block_on(async {
+            client
+                .batch_fetch_row(
+                    &mut writer,
+                    &mut stmt.stream_string_buf,
+                    &mut stmt.stream_bytes_buf,
+                )
+                .await
+                .map_err(|e| e.to_string())
+        });
+
+        // Transfer info messages
+        for (number, message) in writer.info_messages {
+            stmt.diagnostics.push(DiagRecord {
+                state: "01000".to_string(),
+                native_error: number as i32,
+                message,
+            });
+        }
+
+        match result {
+            Ok(BatchFetchResult::Row) => {
+                stmt.row_index += 1;
+                // Store the row in stmt.rows as a single-element buffer for get_data compatibility
+                stmt.rows.clear();
+                stmt.rows.push(std::mem::take(&mut stmt.current_row));
+                stmt.row_index = 0; // always index 0 in single-row buffer
+                SQL_SUCCESS
+            }
+            Ok(BatchFetchResult::Done(_)) => {
+                stmt.streaming = false;
+                SQL_NO_DATA
+            }
+            Ok(BatchFetchResult::MoreResults) => {
+                // Current result set done, but more follow
+                stmt.streaming = false;
+                SQL_NO_DATA
+            }
+            Err(msg) => {
+                stmt.streaming = false;
+                stmt.diagnostics.push(DiagRecord {
+                    state: "HY000".to_string(),
+                    native_error: 0,
+                    message: msg,
+                });
+                SQL_ERROR
+            }
+        }
     } else {
-        SQL_SUCCESS
+        // Non-streaming mode (buffered rows from pending_result_sets, or legacy)
+        stmt.row_index += 1;
+        if stmt.row_index as usize >= stmt.rows.len() {
+            SQL_NO_DATA
+        } else {
+            SQL_SUCCESS
+        }
     }
 }
 

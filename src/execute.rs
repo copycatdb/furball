@@ -17,6 +17,12 @@ pub fn exec_direct(stmt: &mut Statement, sql: &str) -> SQLRETURN {
         }
     };
 
+    // If we were previously streaming, drain the old stream first
+    if stmt.streaming {
+        let _ = runtime::block_on(async { client.batch_drain().await });
+        stmt.streaming = false;
+    }
+
     // If autocommit is OFF and we're not already in a transaction, start one
     if !conn.autocommit && !conn.in_transaction {
         let begin_result = runtime::block_on(async {
@@ -37,59 +43,59 @@ pub fn exec_direct(stmt: &mut Statement, sql: &str) -> SQLRETURN {
         conn.in_transaction = true;
     }
 
-    let mut writer = StringRowWriter::new();
     let sql = sql.to_string();
 
+    // Use streaming API: send query, read only until metadata
+    let mut rows_affected = 0u64;
     let result = runtime::block_on(async {
         client
-            .batch_into(sql, &mut writer)
+            .batch_start_with_rowcount(sql, &mut rows_affected)
             .await
             .map_err(|e| e.to_string())
     });
 
     match result {
-        Ok(()) => {
-            writer.finalize();
-            // Pop the first result set as the current one
-            let first = if !writer.result_sets.is_empty() {
-                Some(writer.result_sets.remove(0))
-            } else {
-                None
-            };
-            if let Some(rs) = first {
-                stmt.columns = rs.columns;
-                stmt.rows = rs.rows;
-                stmt.row_count = if stmt.columns.is_empty() {
-                    if rs.done_rows == 0 {
-                        -1
-                    } else {
-                        rs.done_rows as SQLLEN
-                    }
-                } else {
-                    -1
-                };
-            } else {
+        Ok(columns) => {
+            if columns.is_empty() {
+                // No result set (DML statement) — the stream is already done
                 stmt.columns = Vec::new();
                 stmt.rows = Vec::new();
-                stmt.row_count = -1;
-            }
-            stmt.pending_result_sets = writer.result_sets;
-            stmt.row_index = -1;
-            stmt.executed = true;
-            stmt.read_offsets.clear();
-            // Transfer info messages to diagnostics
-            if !writer.info_messages.is_empty() {
-                for (number, message) in &writer.info_messages {
-                    stmt.diagnostics.push(DiagRecord {
-                        state: "01000".to_string(),
-                        native_error: *number as i32,
-                        message: message.clone(),
-                    });
-                }
-                SQL_SUCCESS_WITH_INFO
+                stmt.row_count = if rows_affected == 0 {
+                    -1
+                } else {
+                    rows_affected as SQLLEN
+                };
+                stmt.row_index = -1;
+                stmt.executed = true;
+                stmt.streaming = false;
+                stmt.read_offsets.clear();
+                stmt.pending_result_sets.clear();
+                stmt.current_row.clear();
             } else {
-                SQL_SUCCESS
+                // Has result set — set up columns, enable streaming
+                stmt.columns = columns
+                    .iter()
+                    .map(|c| {
+                        let (sql_type, size, decimal_digits, nullable) = sql_type_from_column(c);
+                        ColumnDesc {
+                            name: c.name().to_string(),
+                            sql_type,
+                            size,
+                            decimal_digits,
+                            nullable,
+                        }
+                    })
+                    .collect();
+                stmt.rows = Vec::new(); // no rows buffered
+                stmt.row_count = -1;
+                stmt.row_index = -1;
+                stmt.executed = true;
+                stmt.streaming = true;
+                stmt.read_offsets.clear();
+                stmt.pending_result_sets.clear();
+                stmt.current_row.clear();
             }
+            SQL_SUCCESS
         }
         Err(msg) => {
             let (state, native) = map_sqlstate(&msg);
@@ -105,19 +111,17 @@ pub fn exec_direct(stmt: &mut Statement, sql: &str) -> SQLRETURN {
 
 /// Parse SQL Server error number from error message and map to SQLSTATE
 fn map_sqlstate(msg: &str) -> (String, i32) {
-    // Try to extract error number: patterns like "Msg 2627" or "number: 2627" or just the number
     let native = extract_error_number(msg);
     let state = match native {
-        2627 | 2601 | 547 => "23000", // integrity constraint violation
-        208 => "42S02",               // table not found
-        156 | 102 => "42000",         // syntax error
-        _ => "HY000",                 // general error
+        2627 | 2601 | 547 => "23000",
+        208 => "42S02",
+        156 | 102 => "42000",
+        _ => "HY000",
     };
     (state.to_string(), native)
 }
 
 fn extract_error_number(msg: &str) -> i32 {
-    // Look for "code: NNNN" pattern (tabby/tiberius error format)
     if let Some(idx) = msg.find("code: ") {
         let rest = &msg[idx + 6..];
         if let Some(end) = rest.find(|c: char| !c.is_ascii_digit()) {
@@ -128,7 +132,6 @@ fn extract_error_number(msg: &str) -> i32 {
             return n;
         }
     }
-    // Look for "number: NNNN" pattern
     if let Some(idx) = msg.find("number: ") {
         let rest = &msg[idx + 8..];
         if let Some(end) = rest.find(|c: char| !c.is_ascii_digit()) {
@@ -139,7 +142,6 @@ fn extract_error_number(msg: &str) -> i32 {
             return n;
         }
     }
-    // Look for "Msg NNNN" pattern
     if let Some(idx) = msg.find("Msg ") {
         let rest = &msg[idx + 4..];
         if let Some(end) = rest.find(|c: char| !c.is_ascii_digit()) {

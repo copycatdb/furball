@@ -149,6 +149,10 @@ fn alloc_handle_impl(
                 dae_collected: Vec::new(),
                 dae_current_buf: Vec::new(),
                 pending_result_sets: Vec::new(),
+                streaming: false,
+                stream_string_buf: String::with_capacity(4096),
+                stream_bytes_buf: Vec::with_capacity(4096),
+                current_row: Vec::new(),
             });
             let stmt_ptr = Box::into_raw(stmt);
             if !input_handle.is_null() {
@@ -220,6 +224,14 @@ pub extern "C" fn SQLFreeStmt(hstmt: SQLHSTMT, option: SQLUSMALLINT) -> SQLRETUR
     let stmt = unsafe { &mut *(hstmt as *mut Statement) };
     match option {
         SQL_CLOSE => {
+            // If we're in streaming mode, drain the remaining tokens
+            if stmt.streaming {
+                let conn = unsafe { &mut *stmt.conn };
+                if let Some(client) = conn.client.as_mut() {
+                    let _ = runtime::block_on(async { client.batch_drain().await });
+                }
+                stmt.streaming = false;
+            }
             stmt.columns.clear();
             stmt.rows.clear();
             stmt.row_index = -1;
@@ -227,6 +239,7 @@ pub extern "C" fn SQLFreeStmt(hstmt: SQLHSTMT, option: SQLUSMALLINT) -> SQLRETUR
             stmt.row_count = -1;
             stmt.read_offsets.clear();
             stmt.pending_result_sets.clear();
+            stmt.current_row.clear();
             SQL_SUCCESS
         }
         SQL_UNBIND | SQL_RESET_PARAMS => {
@@ -1613,24 +1626,96 @@ pub extern "C" fn SQLMoreResults(hstmt: SQLHSTMT) -> SQLRETURN {
         return SQL_INVALID_HANDLE;
     }
     let stmt = unsafe { &mut *(hstmt as *mut Statement) };
-    if stmt.pending_result_sets.is_empty() {
-        return SQL_NO_DATA;
-    }
-    let rs = stmt.pending_result_sets.remove(0);
-    stmt.columns = rs.columns;
-    stmt.rows = rs.rows;
-    stmt.row_index = -1;
-    stmt.read_offsets.clear();
-    stmt.row_count = if stmt.columns.is_empty() {
-        if rs.done_rows == 0 {
-            -1
-        } else {
-            rs.done_rows as SQLLEN
+
+    if stmt.streaming {
+        // Drain remaining rows in current result set
+        let conn = unsafe { &mut *stmt.conn };
+        let client = match conn.client.as_mut() {
+            Some(c) => c,
+            None => return SQL_NO_DATA,
+        };
+
+        let result: Result<bool, tabby::error::Error> = runtime::block_on(async {
+            let mut dummy_writer = handle::SingleRowDrainWriter;
+            let mut s = String::new();
+            let mut b = Vec::new();
+            loop {
+                match client
+                    .batch_fetch_row(&mut dummy_writer, &mut s, &mut b)
+                    .await?
+                {
+                    tabby::BatchFetchResult::Row => continue,
+                    tabby::BatchFetchResult::Done(_) => return Ok(false),
+                    tabby::BatchFetchResult::MoreResults => return Ok(true),
+                }
+            }
+        });
+
+        match result {
+            Ok(true) => {
+                // Read next result set metadata
+                let meta_result = runtime::block_on(async { client.batch_fetch_metadata().await });
+                match meta_result {
+                    Ok(columns) if !columns.is_empty() => {
+                        stmt.columns = columns
+                            .iter()
+                            .map(|c| {
+                                let (sql_type, size, decimal_digits, nullable) =
+                                    handle::sql_type_from_column(c);
+                                handle::ColumnDesc {
+                                    name: c.name().to_string(),
+                                    sql_type,
+                                    size,
+                                    decimal_digits,
+                                    nullable,
+                                }
+                            })
+                            .collect();
+                        stmt.rows.clear();
+                        stmt.row_index = -1;
+                        stmt.read_offsets.clear();
+                        stmt.row_count = -1;
+                        stmt.streaming = true;
+                        SQL_SUCCESS
+                    }
+                    Ok(_) => {
+                        stmt.streaming = false;
+                        SQL_NO_DATA
+                    }
+                    Err(_) => {
+                        stmt.streaming = false;
+                        SQL_NO_DATA
+                    }
+                }
+            }
+            Ok(false) => {
+                stmt.streaming = false;
+                SQL_NO_DATA
+            }
+            Err(_) => {
+                stmt.streaming = false;
+                SQL_NO_DATA
+            }
         }
+    } else if !stmt.pending_result_sets.is_empty() {
+        let rs = stmt.pending_result_sets.remove(0);
+        stmt.columns = rs.columns;
+        stmt.rows = rs.rows;
+        stmt.row_index = -1;
+        stmt.read_offsets.clear();
+        stmt.row_count = if stmt.columns.is_empty() {
+            if rs.done_rows == 0 {
+                -1
+            } else {
+                rs.done_rows as SQLLEN
+            }
+        } else {
+            -1
+        };
+        SQL_SUCCESS
     } else {
-        -1
-    };
-    SQL_SUCCESS
+        SQL_NO_DATA
+    }
 }
 
 #[unsafe(no_mangle)]
