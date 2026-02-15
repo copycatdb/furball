@@ -101,13 +101,13 @@ jobs:
         run: |
           source <(cargo llvm-cov show-env --export-prefix)
           cargo llvm-cov clean --workspace
-          cargo build --release
+          cargo build
       - name: Configure ODBC driver
         run: |
           sudo tee /etc/odbcinst.ini > /dev/null <<EOF
           [Furball]
           Description = Furball ODBC Driver
-          Driver = ${{ github.workspace }}/target/release/libfurball.so
+          Driver = ${{ github.workspace }}/target/debug/libfurball.so
           EOF
       - name: Build Google Tests
         run: |
