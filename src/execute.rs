@@ -33,10 +33,10 @@ pub fn exec_direct(stmt: &mut Statement, sql: &str) -> SQLRETURN {
             stmt.rows = writer.rows;
             stmt.row_index = -1;
             stmt.executed = true;
-            // row_count: for SELECT it's -1 (unknown), for DML it's the number of rows
-            // If there are columns, it's a SELECT; otherwise it's DML
+            // For SELECT (has columns), row_count is -1 (unknown per ODBC spec)
+            // For DML (no columns), use the done_rows from the Done token
             stmt.row_count = if stmt.columns.is_empty() {
-                stmt.rows.len() as SQLLEN
+                writer.done_rows as SQLLEN
             } else {
                 -1
             };

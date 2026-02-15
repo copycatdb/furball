@@ -67,6 +67,7 @@ pub struct StringRowWriter {
     pub rows: Vec<Vec<Option<String>>>,
     current_row: Vec<Option<String>>,
     got_metadata: bool,
+    pub done_rows: u64,
 }
 
 impl StringRowWriter {
@@ -76,6 +77,7 @@ impl StringRowWriter {
             rows: Vec::new(),
             current_row: Vec::new(),
             got_metadata: false,
+            done_rows: 0,
         }
     }
 }
@@ -160,6 +162,10 @@ impl RowWriter for StringRowWriter {
             );
             self.rows.push(row);
         }
+    }
+
+    fn on_done(&mut self, rows: u64) {
+        self.done_rows += rows;
     }
 
     fn write_null(&mut self, _col: usize) {

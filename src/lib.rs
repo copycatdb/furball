@@ -1102,7 +1102,7 @@ fn catalog_columns(
 
     let mut conditions = vec!["1=1".to_string()];
     if !table.is_empty() && table != "%" {
-        conditions.push(format!("t.name LIKE N'{}'", table.replace('\'', "''")));
+        conditions.push(format!("o.name LIKE N'{}'", table.replace('\'', "''")));
     }
     if !schema.is_empty() && schema != "%" {
         conditions.push(format!("s.name LIKE N'{}'", schema.replace('\'', "''")));
@@ -1112,20 +1112,20 @@ fn catalog_columns(
     }
 
     let sql = format!(
-        "SELECT DB_NAME() AS TABLE_CAT, s.name AS TABLE_SCHEM, t.name AS TABLE_NAME, \
+        "SELECT DB_NAME() AS TABLE_CAT, s.name AS TABLE_SCHEM, o.name AS TABLE_NAME, \
          c.name AS COLUMN_NAME, \
          tp.system_type_id AS DATA_TYPE, \
          tp.name AS TYPE_NAME, \
-         c.max_length AS COLUMN_SIZE, \
-         c.max_length AS BUFFER_LENGTH, \
+         COALESCE(c.max_length, 0) AS COLUMN_SIZE, \
+         COALESCE(c.max_length, 0) AS BUFFER_LENGTH, \
          c.scale AS DECIMAL_DIGITS, \
          10 AS NUM_PREC_RADIX, \
          CASE c.is_nullable WHEN 1 THEN 1 ELSE 0 END AS NULLABLE, \
          CAST(NULL AS NVARCHAR(1)) AS REMARKS, \
          c.column_id AS ORDINAL_POSITION \
-         FROM sys.columns c \
-         JOIN sys.tables t ON c.object_id = t.object_id \
-         JOIN sys.schemas s ON t.schema_id = s.schema_id \
+         FROM sys.all_columns c \
+         JOIN sys.all_objects o ON c.object_id = o.object_id \
+         JOIN sys.schemas s ON o.schema_id = s.schema_id \
          JOIN sys.types tp ON c.system_type_id = tp.system_type_id AND tp.system_type_id = tp.user_type_id \
          WHERE {} ORDER BY TABLE_SCHEM, TABLE_NAME, ORDINAL_POSITION",
         conditions.join(" AND ")
