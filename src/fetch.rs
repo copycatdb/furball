@@ -84,65 +84,94 @@ pub fn fetch(stmt: &mut Statement) -> SQLRETURN {
     stmt.read_offsets.clear();
 
     if stmt.streaming {
-        // Streaming mode: fetch next row from the TDS stream
-        let conn = unsafe { &mut *stmt.conn };
-        let client = match conn.client.as_mut() {
-            Some(c) => c,
-            None => return SQL_ERROR,
-        };
+        // If prefetch buffer is empty and no terminal state, fill it
+        if stmt.prefetch_buffer.is_empty() && stmt.prefetch_done.is_none() {
+            let conn = unsafe { &mut *stmt.conn };
+            let client = match conn.client.as_mut() {
+                Some(c) => c,
+                None => return SQL_ERROR,
+            };
 
-        stmt.current_row.clear();
-        let mut writer = SingleRowWriter {
-            row: &mut stmt.current_row,
-            info_messages: Vec::new(),
-        };
+            let mut row_buf = Vec::new();
+            let mut info_msgs = Vec::new();
+            let string_buf = &mut stmt.stream_string_buf;
+            let bytes_buf = &mut stmt.stream_bytes_buf;
+            let prefetch_buffer = &mut stmt.prefetch_buffer;
 
-        let result = runtime::block_on(async {
-            client
-                .batch_fetch_row(
-                    &mut writer,
-                    &mut stmt.stream_string_buf,
-                    &mut stmt.stream_bytes_buf,
-                )
-                .await
-                .map_err(|e| e.to_string())
-        });
-
-        // Transfer info messages
-        for (number, message) in writer.info_messages {
-            stmt.diagnostics.push(DiagRecord {
-                state: "01000".to_string(),
-                native_error: number as i32,
-                message,
+            let terminal = runtime::block_on(async {
+                for _ in 0..256 {
+                    row_buf.clear();
+                    let mut writer = SingleRowWriter {
+                        row: &mut row_buf,
+                        info_messages: Vec::new(),
+                    };
+                    match client
+                        .batch_fetch_row(&mut writer, string_buf, bytes_buf)
+                        .await
+                    {
+                        Ok(BatchFetchResult::Row) => {
+                            info_msgs.extend(writer.info_messages);
+                            prefetch_buffer.push_back(std::mem::replace(&mut row_buf, Vec::new()));
+                        }
+                        Ok(BatchFetchResult::Done(_)) => {
+                            info_msgs.extend(writer.info_messages);
+                            return Some(PrefetchTerminal::Done);
+                        }
+                        Ok(BatchFetchResult::MoreResults) => {
+                            info_msgs.extend(writer.info_messages);
+                            return Some(PrefetchTerminal::MoreResults);
+                        }
+                        Err(e) => {
+                            info_msgs.extend(writer.info_messages);
+                            return Some(PrefetchTerminal::Error(e.to_string()));
+                        }
+                    }
+                }
+                None // filled 256 rows, no terminal yet
             });
+
+            // Transfer info messages
+            for (number, message) in info_msgs {
+                stmt.diagnostics.push(DiagRecord {
+                    state: "01000".to_string(),
+                    native_error: number as i32,
+                    message,
+                });
+            }
+
+            stmt.prefetch_done = terminal;
         }
 
-        match result {
-            Ok(BatchFetchResult::Row) => {
-                stmt.row_index += 1;
-                // Store the row in stmt.rows as a single-element buffer for get_data compatibility
+        // Pop from buffer
+        match stmt.prefetch_buffer.pop_front() {
+            Some(row) => {
                 stmt.rows.clear();
-                stmt.rows.push(std::mem::take(&mut stmt.current_row));
-                stmt.row_index = 0; // always index 0 in single-row buffer
+                stmt.rows.push(row);
+                stmt.row_index = 0;
                 SQL_SUCCESS
             }
-            Ok(BatchFetchResult::Done(_)) => {
-                stmt.streaming = false;
-                SQL_NO_DATA
-            }
-            Ok(BatchFetchResult::MoreResults) => {
-                // Current result set done, but more follow
-                stmt.streaming = false;
-                SQL_NO_DATA
-            }
-            Err(msg) => {
-                stmt.streaming = false;
-                stmt.diagnostics.push(DiagRecord {
-                    state: "HY000".to_string(),
-                    native_error: 0,
-                    message: msg,
-                });
-                SQL_ERROR
+            None => {
+                // Buffer empty — handle terminal state
+                match stmt.prefetch_done.take() {
+                    Some(PrefetchTerminal::Done) => {
+                        stmt.streaming = false;
+                        SQL_NO_DATA
+                    }
+                    Some(PrefetchTerminal::MoreResults) => {
+                        stmt.streaming = false;
+                        SQL_NO_DATA
+                    }
+                    Some(PrefetchTerminal::Error(msg)) => {
+                        stmt.streaming = false;
+                        stmt.diagnostics.push(DiagRecord {
+                            state: "HY000".to_string(),
+                            native_error: 0,
+                            message: msg,
+                        });
+                        SQL_ERROR
+                    }
+                    None => SQL_NO_DATA,
+                }
             }
         }
     } else {

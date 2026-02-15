@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use crate::types::*;
 use tabby::RowWriter;
 
@@ -218,6 +220,15 @@ pub struct Statement {
     pub stream_string_buf: String, // reusable buffer for streaming decode
     pub stream_bytes_buf: Vec<u8>, // reusable buffer for streaming decode
     pub current_row: Vec<CellValue>, // single-row buffer for streaming fetch
+    pub prefetch_buffer: VecDeque<Vec<CellValue>>, // pre-fetched rows for streaming mode
+    pub prefetch_done: Option<PrefetchTerminal>, // terminal state from prefetch
+}
+
+/// Terminal state saved when prefetch batch hits end-of-stream
+pub enum PrefetchTerminal {
+    Done,
+    MoreResults,
+    Error(String),
 }
 
 /// A bound parameter

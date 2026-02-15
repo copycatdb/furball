@@ -71,6 +71,8 @@ pub fn exec_direct(stmt: &mut Statement, sql: &str) -> SQLRETURN {
                 stmt.read_offsets.clear();
                 stmt.pending_result_sets.clear();
                 stmt.current_row.clear();
+                stmt.prefetch_buffer.clear();
+                stmt.prefetch_done = None;
             } else {
                 // Has result set — set up columns, enable streaming
                 stmt.columns = columns
@@ -94,6 +96,8 @@ pub fn exec_direct(stmt: &mut Statement, sql: &str) -> SQLRETURN {
                 stmt.read_offsets.clear();
                 stmt.pending_result_sets.clear();
                 stmt.current_row.clear();
+                stmt.prefetch_buffer.clear();
+                stmt.prefetch_done = None;
             }
             SQL_SUCCESS
         }

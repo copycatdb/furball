@@ -153,6 +153,8 @@ fn alloc_handle_impl(
                 stream_string_buf: String::with_capacity(4096),
                 stream_bytes_buf: Vec::with_capacity(4096),
                 current_row: Vec::new(),
+                prefetch_buffer: std::collections::VecDeque::new(),
+                prefetch_done: None,
             });
             let stmt_ptr = Box::into_raw(stmt);
             if !input_handle.is_null() {
@@ -240,6 +242,8 @@ pub extern "C" fn SQLFreeStmt(hstmt: SQLHSTMT, option: SQLUSMALLINT) -> SQLRETUR
             stmt.read_offsets.clear();
             stmt.pending_result_sets.clear();
             stmt.current_row.clear();
+            stmt.prefetch_buffer.clear();
+            stmt.prefetch_done = None;
             SQL_SUCCESS
         }
         SQL_UNBIND | SQL_RESET_PARAMS => {
@@ -1676,6 +1680,8 @@ pub extern "C" fn SQLMoreResults(hstmt: SQLHSTMT) -> SQLRETURN {
                         stmt.read_offsets.clear();
                         stmt.row_count = -1;
                         stmt.streaming = true;
+                        stmt.prefetch_buffer.clear();
+                        stmt.prefetch_done = None;
                         SQL_SUCCESS
                     }
                     Ok(_) => {
