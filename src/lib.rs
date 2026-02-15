@@ -1430,11 +1430,11 @@ fn read_param_value(param: &BoundParam) -> String {
             }
             SQL_C_DOUBLE => {
                 let v = *(param.value_ptr as *const f64);
-                format_float_f64(v)
+                format!("CAST({} AS float)", format_float_f64(v))
             }
             SQL_C_FLOAT => {
                 let v = *(param.value_ptr as *const f32);
-                format_float_f64(v as f64)
+                format!("CAST({} AS real)", format_float_f64(v as f64))
             }
             SQL_C_BIT => {
                 let v = *(param.value_ptr as *const u8);
@@ -2394,9 +2394,36 @@ pub extern "C" fn SQLParamData(hstmt: SQLHSTMT, value_ptr_ptr: *mut SQLPOINTER) 
                 // Check if this param was DAE-collected
                 if let Some((_num, data)) = stmt.dae_collected.iter().find(|(n, _)| *n == param_idx)
                 {
-                    // Escape and quote the string
-                    let escaped = data.replace('\'', "''");
-                    result.push_str(&format!("N'{}'", escaped));
+                    // Check the parameter type to decide quoting
+                    let param_type = stmt
+                        .bound_params
+                        .iter()
+                        .find(|p| p.param_number == param_idx)
+                        .map(|p| p.parameter_type)
+                        .unwrap_or(SQL_VARCHAR);
+                    let is_numeric = matches!(
+                        param_type,
+                        SQL_INTEGER
+                            | SQL_SMALLINT
+                            | SQL_TINYINT
+                            | SQL_BIGINT
+                            | SQL_DOUBLE
+                            | SQL_FLOAT
+                            | SQL_REAL
+                            | SQL_NUMERIC
+                            | SQL_DECIMAL
+                            | SQL_BIT
+                    );
+                    if matches!(param_type, SQL_DOUBLE | SQL_FLOAT) {
+                        result.push_str(&format!("CAST({} AS float)", data));
+                    } else if param_type == SQL_REAL {
+                        result.push_str(&format!("CAST({} AS real)", data));
+                    } else if is_numeric {
+                        result.push_str(data);
+                    } else {
+                        let escaped = data.replace('\'', "''");
+                        result.push_str(&format!("N'{}'", escaped));
+                    }
                 } else if let Some(param) = stmt
                     .bound_params
                     .iter()
