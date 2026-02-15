@@ -108,7 +108,7 @@ pub fn fetch(stmt: &mut Statement) -> SQLRETURN {
                     match client.batch_fetch_row(&mut writer, string_buf, bytes_buf) {
                         Ok(BatchFetchResult::Row) => {
                             info_msgs.extend(writer.info_messages);
-                            prefetch_buffer.push_back(std::mem::replace(&mut row_buf, Vec::new()));
+                            prefetch_buffer.push_back(std::mem::take(&mut row_buf));
                         }
                         Ok(BatchFetchResult::Done(_)) => {
                             info_msgs.extend(writer.info_messages);
@@ -622,7 +622,7 @@ pub fn get_data(
                 CellValue::Guid(g) => g.to_vec(),
                 _ => {
                     let s = cell.to_string_repr().unwrap_or_default();
-                    if s.chars().all(|c| c.is_ascii_hexdigit()) && s.len() % 2 == 0 {
+                    if s.chars().all(|c| c.is_ascii_hexdigit()) && s.len().is_multiple_of(2) {
                         hex_decode(&s)
                     } else {
                         s.into_bytes()
